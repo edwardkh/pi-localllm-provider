@@ -1,6 +1,6 @@
 {
   "name": "pi-localllm-provider",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Wizard-based provider setup for local OpenAI-compatible LLM servers (vLLM, Ollama, LM Studio, llama.cpp, …)",
   "main": "index.ts",
@@ -32,7 +32,9 @@
     "LICENSE"
   ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
     "test": "vitest run",
