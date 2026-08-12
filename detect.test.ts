@@ -495,10 +495,146 @@ describe("detectOpenAI", () => {
     expect(result.models.map((m) => m.contextWindow)).toEqual([16384, 8192, 32768]);
   });
 
+  it("reads OpenRouter-style context_length and top_provider.context_length", async () => {
+    mockFetch({
+      "http://x/v1/models": {
+        data: [
+          { id: "m1", context_length: 131072 },
+          { id: "m2", context_length: 8192, top_provider: { context_length: 131072 } },
+        ],
+      },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models.map((m) => m.contextWindow)).toEqual([131072, 131072]);
+  });
+
+  it("reads name, reasoning and vision from an OpenRouter-style card", async () => {
+    mockFetch({
+      "http://x/v1/models": {
+        data: [
+          {
+            id: "deepseek-v4-flash",
+            name: "DeepSeek V4 Flash",
+            context_length: 131072,
+            top_provider: { context_length: 131072, max_completion_tokens: 131072 },
+            architecture: { input_modalities: ["text", "image"] },
+            supported_parameters: ["tools", "temperature", "reasoning_effort"],
+          },
+        ],
+      },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models[0]).toMatchObject({
+      id: "deepseek-v4-flash",
+      name: "DeepSeek V4 Flash",
+      contextWindow: 131072,
+      reasoning: true,
+      input: ["text", "image"],
+    });
+  });
+
+  it("ignores a max_completion_tokens that just repeats the context window", async () => {
+    mockFetch({
+      "http://x/v1/models": {
+        data: [
+          { id: "m1", context_length: 131072, top_provider: { max_completion_tokens: 131072 } },
+          { id: "m2", context_length: 131072, top_provider: { max_completion_tokens: 4096 } },
+        ],
+      },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models.map((m) => m.maxTokens)).toEqual([8192, 4096]);
+  });
+
   it("returns an empty model list when the response has no data", async () => {
     mockFetch({ "http://x/v1/models": {} });
     const result = await detectOpenAI("http://x/v1", "");
     expect(result).toEqual({ apiType: "openai", models: [] });
+  });
+});
+
+// A card as ds4_server.c actually emits it — same shape for every alias,
+// since they all report the one loaded GGUF.
+function ds4Card(id: string, ctx = 131072, maxCompletion = 131072) {
+  return {
+    id,
+    object: "model",
+    created: 1767225600,
+    owned_by: "ds4.c",
+    name: "DeepSeek V4 Flash",
+    context_length: ctx,
+    top_provider: { context_length: ctx, max_completion_tokens: maxCompletion, is_moderated: false },
+    supported_parameters: ["tools", "tool_choice", "max_tokens", "temperature", "reasoning_effort"],
+  };
+}
+
+describe("ds4", () => {
+  it("identifies ds4 by owned_by and registers every alias", async () => {
+    mockFetch({
+      "http://x/v1/models": { data: [ds4Card("deepseek-v4-flash"), ds4Card("deepseek-v4-pro")] },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.apiType).toBe("ds4");
+    expect(result.models.map((m) => m.id)).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
+    expect(result.models[0]).toMatchObject({
+      name: "DeepSeek V4 Flash",
+      contextWindow: 131072,
+      maxTokens: 8192,
+      reasoning: true,
+      input: ["text"],
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: true },
+    });
+  });
+
+  // "off" must send an explicit "none": pi-ai drops an unmapped "off" level
+  // instead of sending anything, and ds4 defaults an absent reasoning_effort
+  // to thinking-on-at-HIGH. "max" must be named or pi-ai never offers it.
+  it("maps the two thinking levels ds4 would otherwise get wrong", async () => {
+    mockFetch({ "http://x/v1/models": { data: [ds4Card("deepseek-v4-flash")] } });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models[0].thinkingLevelMap).toEqual({ off: "none", max: "max" });
+  });
+
+  // ds4 folds xhigh into HIGH, making it identical to high — and pi-ai only
+  // offers xhigh when it is mapped, so leaving it out is what hides it.
+  it("leaves xhigh unmapped so Pi does not offer a duplicate of high", async () => {
+    mockFetch({ "http://x/v1/models": { data: [ds4Card("deepseek-v4-flash")] } });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models[0].thinkingLevelMap).not.toHaveProperty("xhigh");
+  });
+
+  // ds4_server.c picks the id set from the loaded engine, so matching on ids
+  // instead of owned_by would miss any engine added later.
+  it("identifies a GLM-DSA engine's alias set too", async () => {
+    mockFetch({
+      "http://x/v1/models": {
+        data: [ds4Card("glm-5.2"), ds4Card("glm-5.2-chat"), ds4Card("glm-5.2-reasoner")],
+      },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.apiType).toBe("ds4");
+    expect(result.models).toHaveLength(3);
+  });
+
+  it("honours --default-tokens when it restricts output below the context", async () => {
+    mockFetch({ "http://x/v1/models": { data: [ds4Card("deepseek-v4-flash", 131072, 4096)] } });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models[0].maxTokens).toBe(4096);
+  });
+
+  it("stays generic when only some cards carry the ds4 owner", async () => {
+    mockFetch({
+      "http://x/v1/models": { data: [ds4Card("deepseek-v4-flash"), { id: "other", owned_by: "acme" }] },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.apiType).toBe("openai");
+    expect(result.models.every((m) => m.compat === undefined)).toBe(true);
+  });
+
+  it("reaches ds4 through the full detection chain", async () => {
+    mockFetch({ "http://x/v1/models": { data: [ds4Card("deepseek-v4-flash")] } });
+    const result = await detectModels("http://x/v1", "");
+    expect(result.apiType).toBe("ds4");
   });
 });
 

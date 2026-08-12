@@ -17,7 +17,15 @@
 //     detectVllm exists purely to label the backend correctly; it extracts the
 //     same max_model_len the generic OpenAI probe already reads.
 
-export type ApiType = "mtplx" | "omlx" | "lmstudio" | "llamacpp" | "ollama" | "vllm" | "openai";
+export type ApiType =
+  | "mtplx"
+  | "omlx"
+  | "lmstudio"
+  | "llamacpp"
+  | "ollama"
+  | "vllm"
+  | "ds4"
+  | "openai";
 
 export interface DiscoveredModel {
   id: string;
@@ -30,7 +38,18 @@ export interface DiscoveredModel {
   loaded?: boolean;
   sizeBytes?: number;
   quantization?: string;
+  // Only set by a detector that has read the backend's source and confirmed
+  // the convention is really implemented. Left undefined everywhere else, so
+  // registration keeps its safe defaults — see the compat note in index.ts.
+  compat?: { supportsReasoningEffort?: boolean; supportsDeveloperRole?: boolean };
+  // Rewrites Pi's thinking levels into the strings this backend actually
+  // accepts. Also gates which levels Pi offers at all: pi-ai's
+  // getSupportedThinkingLevels drops any level mapped to null, and hides
+  // "xhigh"/"max" entirely unless they have an entry here.
+  thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
 }
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface DetectResult {
   apiType: ApiType;
@@ -432,9 +451,101 @@ export async function detectVllm(
 }
 
 // ─── Generic OpenAI-compatible fallback ────────────────────────────
+// Model cards in the wild carry the context window under four different
+// names, so all four are read before falling back to the 32768 default:
+//   - max_model_len          vLLM
+//   - context_window         various MLX-based servers
+//   - context_length         OpenRouter-style cards (top level), used by
+//     any proxy or router that mirrors OpenRouter's /v1/models shape
+//   - top_provider.context_length   same cards, per-provider override —
+//     this is the one that reflects the *serving* limit, so it wins
+//
+// OpenRouter-style cards also carry a human-readable `name`, a declared
+// output ceiling, the accepted input modalities, and the list of request
+// parameters the server honours. Reading them is what separates this from
+// a bare id list; none of the fields is required, and each falls back to
+// the old behaviour when absent.
+
+interface OpenAIModelCard {
+  id: string;
+  name?: string;
+  owned_by?: string;
+  max_model_len?: number;
+  context_window?: number;
+  context_length?: number;
+  top_provider?: { context_length?: number; max_completion_tokens?: number };
+  architecture?: { input_modalities?: string[] };
+  supported_parameters?: string[];
+}
 
 interface OpenAIModels {
-  data?: Array<{ id: string; max_model_len?: number; context_window?: number }>;
+  data?: OpenAIModelCard[];
+}
+
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const v of values) if (typeof v === "number" && v > 0) return v;
+  return undefined;
+}
+
+// ─── ds4 (antirez/ds4, "DwarfStar") ────────────────────────────────
+// ds4 serves nothing outside /v1, publishes no Server header, and has no
+// /health, /props or /version — so it cannot be probed like the backends
+// above. Its one reliable fingerprint is inside the model card the generic
+// probe already fetches, which is why this is a branch of detectOpenAI
+// rather than another link in the chain: ds4_server.c hard-codes
+// `"owned_by":"ds4.c"` on every card, with no conditional around it.
+//
+// Everything else on those cards has to be read from the source rather than
+// taken at face value:
+//   - The ids are aliases, not distinct models. ds4_server.c emits either
+//     {deepseek-v4-flash, deepseek-v4-pro} or, for a GLM-DSA engine,
+//     {glm-5.2, glm-5.2-chat, glm-5.2-reasoner} — but every entry reports
+//     the same loaded GGUF, so name/context/max are identical across them.
+//     Matching on the ids would therefore break on the next engine added;
+//     only owned_by is stable. The aliases are all registered anyway, since
+//     the server accepts each one as a model parameter.
+//   - supported_parameters is a hard-coded constant, not a capability
+//     report — it lists reasoning_effort regardless of which GGUF is
+//     loaded. Reasoning is set here because every engine ds4 serves is a
+//     reasoning model, not because that array says so.
+//   - There is no image handling anywhere in ds4_server.c, so text-only.
+//
+// Both compat conventions are confirmed against the source: reasoning_effort
+// is parsed on the chat path, and the developer role is accepted wherever
+// system is. Turning them on is what makes Pi's thinking levels reach the
+// server at all — but on its own that is not enough to make them *mean*
+// anything, which is what thinkingLevelMap below is for.
+//
+// ds4 collapses effort down to three modes (ds4_server.c's
+// think_mode_from_enabled): NONE, HIGH, and MAX, with everything between
+// "minimal" and "xhigh" landing on HIGH. Two of Pi's seven levels therefore
+// need rewriting, and the rest are already correct as-is:
+//
+//   - "off" is the one that actually matters. pi-ai turns level "off" into
+//     an *absent* reasoning_effort (openai-completions.js: `clampedReasoning
+//     === "off" ? undefined : ...`) unless thinkingLevelMap.off names a
+//     string to send instead. An absent reasoning_effort makes ds4 fall back
+//     to its own defaults — thinking_enabled = true, effort = HIGH — so
+//     without this mapping, selecting "off" in Pi leaves the server thinking
+//     at full strength. Sending "none" is what genuinely disables it.
+//   - "max" is a real, distinct mode in ds4, but pi-ai hides "xhigh"/"max"
+//     from the level list unless thinkingLevelMap has an entry for them, so
+//     it is unreachable until named here.
+//   - "xhigh" is deliberately left out: ds4 folds it into HIGH, making it an
+//     exact duplicate of "high". Offering it would imply a distinction the
+//     server does not make.
+//   - "minimal"/"low"/"medium"/"high" pass through unmapped. ds4 accepts all
+//     four strings and treats them as HIGH, which is as close as it gets.
+
+const DS4_OWNER = "ds4.c";
+
+const DS4_THINKING_LEVELS: Partial<Record<ThinkingLevel, string | null>> = {
+  off: "none",
+  max: "max",
+};
+
+export function isDs4Cards(cards: OpenAIModelCard[]): boolean {
+  return cards.length > 0 && cards.every((m) => m.owned_by === DS4_OWNER);
 }
 
 export async function detectOpenAI(
@@ -446,17 +557,58 @@ export async function detectOpenAI(
   const res = await fetchJson<OpenAIModels>(`${baseUrl}/models`, apiKey, signal, diagnostics);
   if (!res?.data?.length) return { apiType: "openai", models: [] };
 
+  if (isDs4Cards(res.data)) {
+    return {
+      apiType: "ds4",
+      models: res.data.map((m) => {
+        const contextWindow = firstNumber(m.top_provider?.context_length, m.context_length) ?? 32768;
+        const declaredMax = firstNumber(m.top_provider?.max_completion_tokens);
+        return {
+          id: m.id,
+          name: m.name || m.id,
+          contextWindow,
+          maxTokens:
+            declaredMax !== undefined && declaredMax < contextWindow
+              ? declaredMax
+              : capTokens(contextWindow),
+          reasoning: true,
+          input: ["text"] as ("text" | "image")[],
+          compat: { supportsReasoningEffort: true, supportsDeveloperRole: true },
+          thinkingLevelMap: DS4_THINKING_LEVELS,
+        };
+      }),
+    };
+  }
+
   return {
     apiType: "openai",
     models: res.data.map((m) => {
-      const contextWindow = m.max_model_len ?? m.context_window ?? 32768;
+      const contextWindow =
+        firstNumber(
+          m.max_model_len,
+          m.top_provider?.context_length,
+          m.context_window,
+          m.context_length,
+        ) ?? 32768;
+
+      // A declared output ceiling is only trusted when it is a real
+      // restriction. Cards that repeat the whole context window here mean
+      // "no separate output limit", and taking that literally would make
+      // every request reserve the entire window for the response.
+      const declaredMax = firstNumber(m.top_provider?.max_completion_tokens);
+      const maxTokens =
+        declaredMax !== undefined && declaredMax < contextWindow ? declaredMax : capTokens(contextWindow);
+
+      const params = m.supported_parameters ?? [];
+      const modalities = m.architecture?.input_modalities ?? [];
+
       return {
         id: m.id,
-        name: m.id.split("/").pop() ?? m.id,
+        name: m.name || (m.id.split("/").pop() ?? m.id),
         contextWindow,
-        maxTokens: capTokens(contextWindow),
-        reasoning: false,
-        input: ["text"] as ("text" | "image")[],
+        maxTokens,
+        reasoning: params.includes("reasoning_effort") || params.includes("include_reasoning"),
+        input: (modalities.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
       };
     }),
   };

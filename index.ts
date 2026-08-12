@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { detectModels, type ApiType, type DetectResult } from "./detect.ts";
+import { detectModels, type ApiType, type DetectResult, type ThinkingLevel } from "./detect.ts";
 import { deleteFromKeychain, isDirectApiKey, keychainCommand, storeInKeychain } from "./keychain.ts";
 
 // ─── Types ────────────────────────────────────────────────────────
@@ -18,6 +18,8 @@ interface LLMModel {
   loaded?: boolean;
   sizeBytes?: number;
   quantization?: string;
+  compat?: { supportsReasoningEffort?: boolean; supportsDeveloperRole?: boolean };
+  thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
 }
 
 interface LLMServer {
@@ -90,6 +92,7 @@ function apiTypeLabel(apiType: ApiType): string {
     case "llamacpp": return "llama.cpp";
     case "ollama": return "Ollama";
     case "vllm": return "vLLM";
+    case "ds4": return "ds4";
     case "openai": return "OpenAI-compatible";
   }
 }
@@ -172,7 +175,28 @@ function registerServer(pi: ExtensionAPI, server: LLMServer): void {
       // Disabling both keeps `reasoning` read-only: response parsing
       // (reasoning_content, etc.) still works if the backend sends it, but
       // nothing about the outgoing request changes because of it.
-      compat: { supportsReasoningEffort: false, supportsDeveloperRole: false },
+      //
+      // A detector may opt a model back in via `compat`, but only after its
+      // backend's source has been read and both conventions confirmed —
+      // ds4 is currently the only one that qualifies (see detect.ts). The
+      // defaults stay off for everything else, including hand-edited models
+      // and servers configured before this field existed.
+      //
+      // Note what turning supportsReasoningEffort *on* actually changes: with
+      // it off, no reasoning_effort is ever sent and the server keeps using
+      // whatever it defaults to internally, no matter what Pi's status bar
+      // says. Switching it on hands that decision to Pi — which is the point,
+      // but it means a server that was quietly thinking at its own default
+      // now follows the session's thinking level. Where those two disagree,
+      // enabling this looks like a regression ("it stopped thinking") even
+      // though it is the first time the setting was ever connected. A
+      // detector that sets this should also supply thinkingLevelMap, so every
+      // level Pi offers maps onto something the backend really distinguishes.
+      compat: {
+        supportsReasoningEffort: m.compat?.supportsReasoningEffort ?? false,
+        supportsDeveloperRole: m.compat?.supportsDeveloperRole ?? false,
+      },
+      ...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
     })),
   });
 }

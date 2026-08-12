@@ -1,6 +1,6 @@
 # pi-localllm-provider
 
-A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, or anything else with an OpenAI-compatible API.
+A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, ds4, or anything else with an OpenAI-compatible API.
 
 - **One command, one place** — `/localllm` is a single TUI menu for adding, inspecting, and managing every local server's integration with Pi — no subcommands, no hand-editing `settings.json`.
 - **Reads the server, doesn't guess** — context window, reasoning, vision, size, quantization: pulled from real backend APIs across 7 detection paths, not typed into a config file and hoped correct.
@@ -94,15 +94,46 @@ No — every configured server re-registers automatically on startup.
 | llama.cpp (`llama-server`) | `GET /props` + `/v1/models` | context window (`n_ctx`, falls back to `n_ctx_train`), vision, size, `--alias` id |
 | Ollama (native API) | `/api/tags` + `/api/show` per model + `/api/ps` | context window, reasoning, vision, size, quantization, loaded state |
 | vLLM | `GET /version` + `/v1/models` | context window only — see note |
-| OpenAI-compatible | `GET /v1/models` | context window if `max_model_len`/`context_window` present |
+| ds4 | `GET /v1/models` with `owned_by: "ds4.c"` | context window, max tokens, reasoning, request compat — see note |
+| OpenAI-compatible | `GET /v1/models` | context window from `max_model_len`, `top_provider.context_length`, `context_window` or `context_length`; name, reasoning and vision from an OpenRouter-style card |
 
-Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, and vLLM each serve exactly one model, so there's no loaded/unloaded distinction to make.
+Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
 
 vLLM's `/v1/models` never carries reasoning or vision data; its detector exists only to label the backend `[vLLM]` correctly, not to unlock extra metadata.
 
 **Known limitation — vLLM vision/reasoning.** Nothing in vLLM's public API says whether the served model supports images or reasoning, so both always come back `false`/text-only for `[vLLM]` servers, even for VLMs. (vLLM does have an internal `/server_info` debug endpoint that carries this, gated behind a `VLLM_SERVER_DEV_MODE=1` env var — but it's undocumented, dumps your full server config on request, and its system-info collection is known to crash on some setups, so this extension deliberately doesn't probe it.) If a tag is wrong for your model, use **✎ Edit model capabilities** in the server's sub-menu to flip vision/reasoning by hand — same effect as editing `settings.json` directly, just without leaving Pi. It survives until the next **↺ Refresh**, which overwrites it with whatever the server reports.
 
-Flipping `reasoning` to `true` (auto-detected or by hand) only changes how *responses* are parsed. This extension always disables Pi's OpenAI o1-style reasoning-model conventions — the `reasoning_effort` request param and `developer`-role system prompts — for every model it registers, since none of the detection paths above actually confirm the server speaks either convention. So toggling reasoning on is safe to try even against a server that doesn't really support it: nothing about the outgoing request changes because of it.
+**ds4** ([antirez/ds4](https://github.com/antirez/ds4), "DwarfStar") serves nothing outside `/v1` — no `/health`, `/props` or `/version`, and no `Server` header — so it can't be probed the way the backends above are. It's identified instead by the one thing `ds4_server.c` hard-codes onto every model card, `"owned_by":"ds4.c"`, which the generic `/v1/models` request already fetches. Three things on those cards are read from ds4's source rather than taken at face value:
+
+- **The ids are aliases, not separate models.** ds4 emits either `deepseek-v4-flash` + `deepseek-v4-pro`, or `glm-5.2` + `glm-5.2-chat` + `glm-5.2-reasoner` for a GLM-DSA engine — but every entry reports the same GGUF passed with `-m`, so their name, context and max tokens are identical. All of them are registered, since the server accepts each as a `model` parameter, which is why one server can show several same-named entries. Detection keys on `owned_by` alone: matching the ids would break on the next engine ds4 adds.
+- **`supported_parameters` is a constant**, not a capability report — it lists `reasoning_effort` no matter which GGUF is loaded. Reasoning is set for ds4 because every engine it serves is a reasoning model, not because that array says so.
+- **`top_provider.max_completion_tokens` is `min(--default-tokens, --ctx)`.** When it equals the context window it means "no separate output limit", so the usual max-tokens cap applies instead of reserving the whole window for one response.
+
+Flipping `reasoning` to `true` (auto-detected or by hand) only changes how *responses* are parsed. This extension disables Pi's OpenAI o1-style reasoning-model conventions — the `reasoning_effort` request param and `developer`-role system prompts — by default for every model it registers, since most detection paths above can't confirm the server speaks either convention. So toggling reasoning on is safe to try even against a server that doesn't really support it: nothing about the outgoing request changes because of it.
+
+ds4 is the one exception, and only because both conventions were confirmed in its source: it parses `reasoning_effort` on the chat path, and accepts the `developer` role wherever it accepts `system`. Both are enabled for `[ds4]` models, which is what lets Pi's thinking levels actually reach the server. Hand-edited models and servers configured before this existed keep the safe defaults.
+
+### Thinking levels on ds4
+
+Worth understanding before reading anything into the status bar, because the interesting cases are the ones where Pi and the server disagree.
+
+While `supportsReasoningEffort` is off — the default for every backend except ds4 — Pi never sends `reasoning_effort` at all, so the server keeps using whatever it defaults to internally and the level shown in Pi has no effect on it whatsoever. Turning it on is what connects the two for the first time. That can look like a regression: a server quietly running at its own default now follows the session instead. It isn't one — it's the first time the setting was ever wired up.
+
+ds4 recognises only three modes internally (`think_mode_from_enabled` in `ds4_server.c`) — off, high, and max — so Pi's seven levels don't map one-to-one. Two of them would land somewhere surprising without help:
+
+- **`off` would not turn thinking off.** Pi converts an `off` level into an *omitted* `reasoning_effort` rather than a value, and ds4 reads an omitted one as "use my defaults", which are thinking-enabled at high. The `[ds4]` detector maps `off` to the literal `"none"` — the only string that genuinely disables it.
+- **`max` would be unreachable.** Pi hides `xhigh` and `max` unless a model explicitly declares them, so ds4's real max mode wouldn't appear in the level list. The detector declares `max`, but deliberately not `xhigh`: ds4 folds `xhigh` into high, so offering it would imply a distinction that doesn't exist.
+
+That leaves this mapping, with `minimal`/`low`/`medium`/`high` passing through unchanged — ds4 accepts all four and treats them alike:
+
+| Pi level | Sent as | ds4 mode |
+|----------|---------|----------|
+| `off` | `"none"` | no reasoning |
+| `minimal`, `low`, `medium`, `high` | unchanged | high |
+| `xhigh` | not offered | — |
+| `max` | `"max"` | max |
+
+**If the status bar is stuck on `thinking off`,** that's Pi's session state, not a detection problem. Pi carries the current thinking level across model switches whenever the new model supports thinking, and `off` is a legal level for a reasoning model, so nothing raises it back. A model that reported `reasoning: false` earlier in the session — which is how ds4 looked before it was detected properly — pins the level to `off`, and it stays there through the next **↺ Refresh**. Pi deliberately doesn't persist that particular `off` to settings, so set the level once (`pi --thinking high`, or Pi's thinking selector) and it sticks from then on.
 
 ## Configuration
 
