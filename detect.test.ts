@@ -359,19 +359,19 @@ describe("detectLlamaCpp", () => {
 function mockSglang(overrides: { modelInfo?: unknown; serverInfo?: unknown; models?: unknown } = {}) {
   mockFetch({
     "http://x/get_model_info": overrides.modelInfo ?? {
-      model_path: "/models/RadixArk/Qwen3.8-27B-NVFP4",
+      model_path: "/models/Qwen3.8-27B-NVFP4",
       is_generation: true,
       has_image_understanding: true,
     },
     "http://x/get_server_info": overrides.serverInfo ?? { reasoning_parser: "qwen3", context_length: null },
     "http://x/v1/models": overrides.models ?? {
-      data: [{ id: "/models/RadixArk/Qwen3.8-27B-NVFP4", owned_by: "sglang", max_model_len: 262144 }],
+      data: [{ id: "/models/Qwen3.8-27B-NVFP4", owned_by: "sglang", max_model_len: 262144 }],
     },
     "http://x/api/tags": {
       models: [
         {
-          name: "/models/RadixArk/Qwen3.8-27B-NVFP4",
-          model: "/models/RadixArk/Qwen3.8-27B-NVFP4",
+          name: "/models/Qwen3.8-27B-NVFP4",
+          model: "/models/Qwen3.8-27B-NVFP4",
           details: { format: "sglang" },
         },
       ],
@@ -527,7 +527,7 @@ describe("detectSglang", () => {
     expect(result?.apiType).toBe("sglang");
     expect(result?.models).toHaveLength(1);
     expect(result?.models[0]).toMatchObject({
-      id: "/models/RadixArk/Qwen3.8-27B-NVFP4",
+      id: "/models/Qwen3.8-27B-NVFP4",
       name: "Qwen3.8-27B-NVFP4",
       contextWindow: 262144,
       maxTokens: 65536,
