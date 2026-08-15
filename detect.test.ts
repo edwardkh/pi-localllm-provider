@@ -7,7 +7,10 @@ import {
   detectOllama,
   detectOmlx,
   detectOpenAI,
+  detectSglang,
   detectVllm,
+  nearestTier,
+  probeSglangRequestCompat,
 } from "./detect.ts";
 
 function mockFetch(routes: Record<string, unknown>) {
@@ -350,6 +353,299 @@ describe("detectLlamaCpp", () => {
   });
 });
 
+// SGLang's real payloads, trimmed to the fields the detector reads. The
+// /api/* entries are its Ollama compatibility shim, present so the chain
+// tests exercise the ordering that shim makes necessary.
+function mockSglang(overrides: { modelInfo?: unknown; serverInfo?: unknown; models?: unknown } = {}) {
+  mockFetch({
+    "http://x/get_model_info": overrides.modelInfo ?? {
+      model_path: "/models/RadixArk/Qwen3.8-27B-NVFP4",
+      is_generation: true,
+      has_image_understanding: true,
+    },
+    "http://x/get_server_info": overrides.serverInfo ?? { reasoning_parser: "qwen3", context_length: null },
+    "http://x/v1/models": overrides.models ?? {
+      data: [{ id: "/models/RadixArk/Qwen3.8-27B-NVFP4", owned_by: "sglang", max_model_len: 262144 }],
+    },
+    "http://x/api/tags": {
+      models: [
+        {
+          name: "/models/RadixArk/Qwen3.8-27B-NVFP4",
+          model: "/models/RadixArk/Qwen3.8-27B-NVFP4",
+          details: { format: "sglang" },
+        },
+      ],
+    },
+    "http://x/api/show": { model_info: {}, capabilities: ["completion"] },
+  });
+}
+
+// Mirrors a real SGLang probe sweep: GETs answer from `routes`, and each
+// POST /chat/completions is resolved by looking up its reasoning_effort (or
+// "__developer__" for the role probe) in `statuses`.
+function mockSglangProbe(statuses: Record<string, number | "network-error">, routes: Record<string, unknown> = {}) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.endsWith("/chat/completions")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const isDeveloper = (body.messages ?? []).some((m: { role: string }) => m.role === "developer");
+        const key = isDeveloper ? "__developer__" : String(body.reasoning_effort);
+        const status = statuses[key] ?? 400;
+        if (status === "network-error") throw new Error("connection refused");
+        return { ok: status === 200, status, text: async () => "", json: async () => ({}) } as unknown as Response;
+      }
+      if (u in routes) return { ok: true, status: 200, json: async () => routes[u] } as unknown as Response;
+      return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+    }),
+  );
+}
+
+// The vocabulary measured from a real Qwen3.8-27B server, whose template
+// answers 400 with "Supported types are xhigh (default), medium, and low".
+const QWEN38_STATUSES = {
+  none: 200,
+  minimal: 400,
+  low: 200,
+  medium: 200,
+  high: 400,
+  xhigh: 200,
+  max: 400,
+  __developer__: 400,
+};
+
+describe("nearestTier", () => {
+  const accepted = ["none", "low", "medium", "xhigh"];
+
+  it("passes through a level the model accepts verbatim", () => {
+    expect(nearestTier("low", accepted)).toBe("low");
+    expect(nearestTier("xhigh", accepted)).toBe("xhigh");
+  });
+
+  it("lifts a level below the model's floor up to it", () => {
+    expect(nearestTier("minimal", accepted)).toBe("low");
+  });
+
+  it("drops a level above the model's ceiling down to it", () => {
+    expect(nearestTier("max", accepted)).toBe("xhigh");
+  });
+
+  // "high" sits one step from both "medium" and "xhigh"; asking for more
+  // thinking than exists should land under the ceiling, not over it.
+  it("breaks a tie toward the weaker tier", () => {
+    expect(nearestTier("high", accepted)).toBe("medium");
+  });
+
+  // "none" means stop reasoning — it must never win on proximity alone.
+  it("never resolves a thinking level to none", () => {
+    expect(nearestTier("minimal", ["none", "xhigh"])).toBe("xhigh");
+  });
+
+  it("returns undefined when the model accepts no thinking tier", () => {
+    expect(nearestTier("medium", ["none"])).toBeUndefined();
+  });
+});
+
+describe("probeSglangRequestCompat", () => {
+  it("reproduces the map hand-verified against a Qwen3.8 server", async () => {
+    mockSglangProbe(QWEN38_STATUSES);
+    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    expect(result).toEqual({
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: false },
+      thinkingLevelMap: {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "medium",
+        xhigh: "xhigh",
+        max: "xhigh",
+      },
+    });
+  });
+
+  it("records the developer role when the template accepts it", async () => {
+    mockSglangProbe({ ...QWEN38_STATUSES, __developer__: 200 });
+    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    expect(result.compat?.supportsDeveloperRole).toBe(true);
+  });
+
+  // Without an accepted "none" there is no off switch, so leaving the level
+  // unmapped is what makes Pi omit the field and take the model's default.
+  it("leaves off unmapped when the model cannot disable reasoning", async () => {
+    mockSglangProbe({ ...QWEN38_STATUSES, none: 400 });
+    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    expect(result.thinkingLevelMap).not.toHaveProperty("off");
+    expect(result.thinkingLevelMap?.medium).toBe("medium");
+  });
+
+  it("claims nothing when the server rejects every tier", async () => {
+    mockSglangProbe({ __developer__: 400 });
+    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+  });
+
+  // The damaging case: a busy server 503s one tier, and scoring that as
+  // "unsupported" would save a map that 400s on every later request.
+  it("claims nothing when a single tier fails for a reason other than rejection", async () => {
+    mockSglangProbe({ ...QWEN38_STATUSES, medium: 503 });
+    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+  });
+
+  it("treats a rate-limited tier as unanswered, not as unsupported", async () => {
+    mockSglangProbe({ ...QWEN38_STATUSES, xhigh: 429 });
+    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+  });
+
+  it("still trusts a sweep when only the developer probe fails", async () => {
+    mockSglangProbe({ ...QWEN38_STATUSES, __developer__: "network-error" });
+    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    expect(result.compat).toEqual({ supportsReasoningEffort: true, supportsDeveloperRole: false });
+    expect(result.thinkingLevelMap?.high).toBe("medium");
+  });
+
+  // A server that never answers is not evidence against the conventions.
+  it("claims nothing when no probe gets a reply at all", async () => {
+    mockSglangProbe({
+      none: "network-error",
+      minimal: "network-error",
+      low: "network-error",
+      medium: "network-error",
+      high: "network-error",
+      xhigh: "network-error",
+      max: "network-error",
+      __developer__: "network-error",
+    });
+    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+  });
+});
+
+describe("detectSglang", () => {
+  it("reads context from /v1/models and capabilities from the SGLang endpoints", async () => {
+    mockSglang();
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.apiType).toBe("sglang");
+    expect(result?.models).toHaveLength(1);
+    expect(result?.models[0]).toMatchObject({
+      id: "/models/RadixArk/Qwen3.8-27B-NVFP4",
+      name: "Qwen3.8-27B-NVFP4",
+      contextWindow: 262144,
+      maxTokens: 65536,
+      reasoning: true,
+      input: ["text", "image"],
+    });
+  });
+
+  // A Qwen checkpoint's generation_config commonly ships temperature 1.0,
+  // which SGLang applies when the request names none — and Pi's don't. Qwen
+  // publishes 0.6 for thinking mode, and 1.0 makes a thinking model in an
+  // agent loop re-plan until it exhausts the budget.
+  it("applies Qwen's published thinking temperature", async () => {
+    mockSglang({
+      modelInfo: {
+        model_path: "/models/m",
+        is_generation: true,
+        model_type: "qwen3_5",
+        has_image_understanding: true,
+      },
+    });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.models[0].samplingParams).toEqual({ temperature: 0.6 });
+  });
+
+  // A recommendation for one family is not a house style for every model.
+  it("leaves an unfamiliar family on the server's own default", async () => {
+    mockSglang({
+      modelInfo: { model_path: "/models/m", is_generation: true, model_type: "llama" },
+    });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.models[0].samplingParams).toBeUndefined();
+  });
+
+  it("leaves a non-reasoning Qwen alone", async () => {
+    mockSglang({
+      modelInfo: { model_path: "/models/m", is_generation: true, model_type: "qwen3_5" },
+      serverInfo: { reasoning_parser: null },
+    });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.models[0].samplingParams).toBeUndefined();
+  });
+
+  it("attaches the measured request compat to every model", async () => {
+    mockSglangProbe(QWEN38_STATUSES, {
+      "http://x/get_model_info": {
+        model_path: "/models/m",
+        is_generation: true,
+        has_image_understanding: true,
+      },
+      "http://x/get_server_info": { reasoning_parser: "qwen3" },
+      "http://x/v1/models": { data: [{ id: "/models/m", max_model_len: 262144 }] },
+    });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.models[0].compat).toEqual({
+      supportsReasoningEffort: true,
+      supportsDeveloperRole: false,
+    });
+    expect(result?.models[0].thinkingLevelMap?.high).toBe("medium");
+  });
+
+  // reasoning_parser is the whole signal: without one, SGLang never splits
+  // reasoning out of the response, whatever the weights can do — and there
+  // is then nothing worth spending a probe sweep on.
+  it("reports no reasoning, and probes nothing, without a reasoning_parser", async () => {
+    mockSglang({ serverInfo: { reasoning_parser: null } });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.models[0].reasoning).toBe(false);
+    expect(result?.models[0].compat).toBeUndefined();
+    const calls = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls.some((c) => String(c[0]).endsWith("/chat/completions"))).toBe(false);
+  });
+
+  it("reports text-only when the model has no image understanding", async () => {
+    mockSglang({
+      modelInfo: { model_path: "/models/m", is_generation: true, has_image_understanding: false },
+    });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.models[0].input).toEqual(["text"]);
+  });
+
+  // An embedding-only server has no chat endpoint worth registering.
+  it("declines an embedding-only server so the chain keeps looking", async () => {
+    mockSglang({ modelInfo: { model_path: "/models/e", is_generation: false } });
+    expect(await detectSglang("http://x", "http://x/v1", "")).toBeNull();
+  });
+
+  it("returns null when /get_model_info is absent", async () => {
+    mockFetch({ "http://x/v1/models": { data: [{ id: "m", max_model_len: 4096 }] } });
+    expect(await detectSglang("http://x", "http://x/v1", "")).toBeNull();
+  });
+
+  // The regression this detector exists for: SGLang's shim answers /api/tags
+  // and /api/show, so a chain that probed Ollama first would claim it — and
+  // silently lose vision, reasoning, and the resident-model state.
+  it("wins over Ollama in the chain despite the compatibility shim", async () => {
+    mockSglang();
+    const result = await detectModels("http://x/v1", "");
+    expect(result.apiType).toBe("sglang");
+    expect(result.models[0].input).toEqual(["text", "image"]);
+  });
+
+  // The shim must still not cost real Ollama servers their own detection.
+  it("leaves a real Ollama server to the Ollama probe", async () => {
+    mockOllama(
+      { models: [{ name: "llama3:8b", model: "llama3:8b" }] },
+      {
+        "llama3:8b": {
+          model_info: { "general.architecture": "llama", "llama.context_length": 8192 },
+          capabilities: ["completion", "thinking"],
+        },
+      },
+    );
+    const result = await detectModels("http://x/v1", "");
+    expect(result.apiType).toBe("ollama");
+  });
+});
+
 describe("detectOllama", () => {
   it("returns null when there are no local models", async () => {
     mockOllama({ models: [] }, {});
@@ -374,7 +670,7 @@ describe("detectOllama", () => {
           id: "deepseek-r1:latest",
           name: "deepseek-r1:latest",
           contextWindow: 32768,
-          maxTokens: 8192,
+          maxTokens: 16384,
           reasoning: true,
           input: ["text"],
           loaded: false,
@@ -551,6 +847,33 @@ describe("detectOpenAI", () => {
     const result = await detectOpenAI("http://x/v1", "");
     expect(result).toEqual({ apiType: "openai", models: [] });
   });
+
+  // maxTokens is never sent as a request cap, so a bigger number truncates
+  // nothing; it exists so Pi can tell a length-stopped reasoning response
+  // apart from one that simply ran out of its own budget.
+  it("gives a reasoning model more headroom than a plain one", async () => {
+    mockFetch({
+      "http://x/v1/models": {
+        data: [
+          { id: "plain", context_length: 262144 },
+          { id: "thinker", context_length: 262144, supported_parameters: ["reasoning_effort"] },
+        ],
+      },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models.map((m) => m.maxTokens)).toEqual([8192, 65536]);
+  });
+
+  // Half the context still wins when the window is the tighter constraint.
+  it("keeps the half-context floor below either ceiling", async () => {
+    mockFetch({
+      "http://x/v1/models": {
+        data: [{ id: "small", context_length: 8192, supported_parameters: ["reasoning_effort"] }],
+      },
+    });
+    const result = await detectOpenAI("http://x/v1", "");
+    expect(result.models[0].maxTokens).toBe(4096);
+  });
 });
 
 // A card as ds4_server.c actually emits it — same shape for every alias,
@@ -579,7 +902,7 @@ describe("ds4", () => {
     expect(result.models[0]).toMatchObject({
       name: "DeepSeek V4 Flash",
       contextWindow: 131072,
-      maxTokens: 8192,
+      maxTokens: 65536,
       reasoning: true,
       input: ["text"],
       compat: { supportsReasoningEffort: true, supportsDeveloperRole: true },

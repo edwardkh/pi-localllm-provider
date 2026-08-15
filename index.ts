@@ -20,6 +20,7 @@ interface LLMModel {
   quantization?: string;
   compat?: { supportsReasoningEffort?: boolean; supportsDeveloperRole?: boolean };
   thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
+  samplingParams?: { temperature?: number };
 }
 
 interface LLMServer {
@@ -91,6 +92,7 @@ function apiTypeLabel(apiType: ApiType): string {
     case "lmstudio": return "LM Studio";
     case "llamacpp": return "llama.cpp";
     case "ollama": return "Ollama";
+    case "sglang": return "SGLang";
     case "vllm": return "vLLM";
     case "ds4": return "ds4";
     case "openai": return "OpenAI-compatible";
@@ -138,7 +140,10 @@ export function formatModelLine(m: LLMModel): string {
     (c): c is string => c !== null,
   );
   const parts = [`ctx ${formatK(m.contextWindow)}`, `max ${formatK(m.maxTokens)}`];
-  if (typeof m.sizeBytes === "number") parts.push(formatBytes(m.sizeBytes));
+  // A zero size means "not reported", not a zero-byte model — SGLang's Ollama
+  // shim sends size: 0 for the model it is actively serving. Detectors drop it
+  // now, but servers configured before that still have the 0 on disk.
+  if (typeof m.sizeBytes === "number" && m.sizeBytes > 0) parts.push(formatBytes(m.sizeBytes));
   if (m.quantization) parts.push(m.quantization);
   parts.push(...caps);
   return `  • ${loadedIcon(m.loaded)}${m.name}  (${parts.join(", ")})`;
@@ -197,6 +202,9 @@ function registerServer(pi: ExtensionAPI, server: LLMServer): void {
         supportsDeveloperRole: m.compat?.supportsDeveloperRole ?? false,
       },
       ...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
+      // Left off entirely when unset, so the server keeps applying whatever
+      // its own generation_config says rather than a value invented here.
+      ...(m.samplingParams ? { samplingParams: m.samplingParams } : {}),
     })),
   });
 }
@@ -344,15 +352,39 @@ async function editModelCapabilities(
     if (!current) return;
 
     const vision = current.input.includes("image");
+    const temp = current.samplingParams?.temperature;
     const OPT_VISION = `Vision: ${vision ? "on" : "off"}  (tap to turn ${vision ? "off" : "on"})`;
     const OPT_REASONING = `Reasoning: ${current.reasoning ? "on" : "off"}  (tap to turn ${current.reasoning ? "off" : "on"})`;
+    const OPT_TEMP = `Temperature: ${temp ?? "server default"}  (tap to change)`;
     const OPT_DONE = "✓ Done";
 
     const picked = await ctx.ui.select(
       `${current.name} - manual capability override\nOverwritten by the next ↺ Refresh.`,
-      [OPT_VISION, OPT_REASONING, OPT_DONE],
+      [OPT_VISION, OPT_REASONING, OPT_TEMP, OPT_DONE],
     );
     if (!picked || picked === OPT_DONE) break;
+
+    // Asked for before the settings are re-read, so a cancelled prompt
+    // leaves the stored value untouched rather than clearing it.
+    let nextTemp: { temperature?: number } | undefined;
+    if (picked === OPT_TEMP) {
+      const raw = await ctx.ui.input(
+        "Temperature (0 - 2, or empty to let the server decide)",
+        temp === undefined ? "" : String(temp),
+      );
+      if (raw === undefined) continue;
+      const trimmed = raw.trim();
+      if (trimmed === "") {
+        nextTemp = undefined;
+      } else {
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed) || parsed < 0 || parsed > 2) {
+          ctx.ui.notify("Temperature must be a number between 0 and 2.", "error");
+          continue;
+        }
+        nextTemp = { temperature: parsed };
+      }
+    }
 
     const s = readSettings();
     const sv = s.servers.find((sv) => sv.id === serverId);
@@ -361,6 +393,10 @@ async function editModelCapabilities(
       if (m.id !== modelId) return m;
       if (picked === OPT_VISION) {
         return { ...m, input: vision ? (["text"] as const) : (["text", "image"] as const) };
+      }
+      if (picked === OPT_TEMP) {
+        const { samplingParams: _dropped, ...rest } = m;
+        return nextTemp ? { ...rest, samplingParams: nextTemp } : rest;
       }
       return { ...m, reasoning: !m.reasoning };
     });
@@ -378,7 +414,7 @@ async function editModelCapabilities(
 // ─── Server sub-menu ──────────────────────────────────────────────
 
 const OPT_REFRESH = "↺ Refresh model list from server";
-const OPT_CAPS    = "✎ Edit model capabilities (vision / reasoning)";
+const OPT_CAPS    = "✎ Edit model capabilities (vision / reasoning / temperature)";
 const OPT_EDIT    = "✎ Reconfigure (name / URL / key)";
 const OPT_REMOVE  = "✕ Remove this server";
 const OPT_BACK    = "← Back";

@@ -1,6 +1,6 @@
 # pi-localllm-provider
 
-A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, ds4, or anything else with an OpenAI-compatible API.
+A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, SGLang, ds4, or anything else with an OpenAI-compatible API.
 
 - **One command, one place** — `/localllm` is a single TUI menu for adding, inspecting, and managing every local server's integration with Pi — no subcommands, no hand-editing `settings.json`.
 - **Reads the server, doesn't guess** — context window, reasoning, vision, size, quantization: pulled from real backend APIs across 7 detection paths, not typed into a config file and hoped correct.
@@ -92,12 +92,48 @@ No — every configured server re-registers automatically on startup.
 | oMLX | `GET /v1/models/status` | + loaded state, size |
 | LM Studio | `GET /api/v1/models` | + loaded state, size, quantization |
 | llama.cpp (`llama-server`) | `GET /props` + `/v1/models` | context window (`n_ctx`, falls back to `n_ctx_train`), vision, size, `--alias` id |
+| SGLang | `GET /get_model_info` + `/get_server_info` + `/v1/models` | context window, reasoning, vision, measured request compat — see note |
 | Ollama (native API) | `/api/tags` + `/api/show` per model + `/api/ps` | context window, reasoning, vision, size, quantization, loaded state |
 | vLLM | `GET /version` + `/v1/models` | context window only — see note |
 | ds4 | `GET /v1/models` with `owned_by: "ds4.c"` | context window, max tokens, reasoning, request compat — see note |
 | OpenAI-compatible | `GET /v1/models` | context window from `max_model_len`, `top_provider.context_length`, `context_window` or `context_length`; name, reasoning and vision from an OpenRouter-style card |
 
-Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
+Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM, SGLang, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
+
+**SGLang is probed before Ollama, and the order matters.** SGLang ships an Ollama compatibility shim, so its `/api/tags` and `/api/show` answer with Ollama-shaped payloads — enough for the Ollama probe to claim it if it got there first. The shim is lossy in three ways that all read as a working setup, which is what makes the mislabel worth preventing:
+
+- `/api/show` reports `capabilities: ["completion"]` whatever the model can actually do, so **vision and reasoning both come back false**.
+- `/api/ps` isn't implemented, so every model shows as `○ will be loaded on first message` when SGLang in fact holds one model resident for the life of the process.
+- Model ids come through as the raw `--model-path`, so a name like `/models/Org/Model-NVFP4` ends up in the picker.
+
+Probing SGLang first replaces all three with the real answers, from two SGLang-only endpoints: `/get_model_info` for `has_image_understanding` (the vision signal) and `is_generation` (which tells a chat server from an embedding-only one, so the latter falls through instead of being registered), and `/get_server_info` for `reasoning_parser`. That last one is the whole reasoning signal, and it's a property of how the server was launched, not of the weights — SGLang only splits reasoning out of a response when it was started with a parser, so a model that can reason reports `reasoning: false` here until the server is given `--reasoning-parser`. The context window comes from `/v1/models`' `max_model_len`; `/get_server_info`'s `context_length` is the CLI override and stays `null` unless it was passed explicitly.
+
+#### Why SGLang's request compat is measured instead of declared
+
+ds4's `compat` could be hard-coded because its accepted values live in its own source. SGLang's don't — they aren't SGLang's to define. It validates `reasoning_effort` against all seven OpenAI tiers and then hands the string to the model's chat template, and the *template* decides. The vocabularies really do differ: a Qwen3.8 template answers
+
+```
+400  Unexpected reasoning effort high.
+     Supported types are xhigh (default), medium, and low.
+```
+
+while SGLang's own Kimi K3 path recognises `low`/`high`/`max` instead. Hard-coding either set would 400 every request on a server running the other. The `developer` role splits the same way — SGLang's schema accepts the role, and a template that only knows `system` still rejects the message with `Unexpected message role.`
+
+So when a `reasoning_parser` is configured, `Add`/`Refresh` measures both: one throwaway completion per tier, capped at a single token, plus one for the developer role. A rejected tier fails during template rendering, before any generation, so the sweep costs one token per *accepted* tier — four, on the Qwen3.8 server above. Nothing is measured when no parser is configured, since the levels would have nothing to steer.
+
+Levels the model rejects are then mapped to the nearest one it accepts, ties going to the weaker tier so a request for more thinking than exists lands under the ceiling rather than over it. `off` is special-cased: it may only ever map to `none`, never to whatever tier happens to sit nearest, and it stays unmapped on a model with no off switch — which makes Pi omit the field and take the model's default. For Qwen3.8-27B that yields:
+
+| Pi level | Sent as | |
+|----------|---------|---|
+| `off` | `none` | |
+| `minimal` | `low` | lifted to the floor |
+| `low` | `low` | |
+| `medium` | `medium` | |
+| `high` | `medium` | tie, resolved downward |
+| `xhigh` | `xhigh` | |
+| `max` | `xhigh` | dropped to the ceiling |
+
+Without that map, three of Pi's seven levels would 400. If the server can't be reached or answers nothing, no `compat` is recorded at all — an unanswered probe isn't evidence against a convention, so it degrades to the same safe defaults every other backend uses.
 
 vLLM's `/v1/models` never carries reasoning or vision data; its detector exists only to label the backend `[vLLM]` correctly, not to unlock extra metadata.
 
@@ -166,6 +202,29 @@ Stored under the `localllm` key in `~/.pi/agent/settings.json`:
 ```
 
 Hand edits stick until the next **↺ Refresh**, which overwrites every model field with fresh live values — the server is always the source of truth. Useful for correcting a field the server misreports, or for dropping a model locally without changing anything on the server.
+
+### Why `maxTokens` is so much larger for a reasoning model
+
+Pi resolves each turn's `max_tokens` as `options.maxTokens ?? model.maxTokens`, clamped to the context left after the prompt — so this is a real generation cap, and **reasoning and the answer come out of the same budget**.
+
+That matters because no local backend offers a thinking cap worth relying on. Pi can send `thinking_token_budget`, but that is vLLM's field and gated behind a compat flag; SGLang's OpenAI surface accepts `max_thinking_tokens` and then silently ignores it. So a reasoning model that thinks its way to the ceiling spends the *entire* budget reasoning and returns no answer at all — which then reads as a truncated turn, gets fed back with a truncation notice, and re-plans into the same wall. Setting the number too low doesn't prevent that; it just reaches it sooner.
+
+Hence the fallback where a backend reports no limit of its own:
+
+| | Ceiling |
+|---|---------|
+| Reasoning model | `min(context ÷ 2, 65536)` |
+| Everything else | `min(context ÷ 2, 8192)` |
+
+Backends that *do* report a real limit — MTPLX's `max_response_tokens`, oMLX's `max_tokens`, an OpenRouter-style `max_completion_tokens` below the context window — are believed over both.
+
+### Sampling
+
+Nothing is sent unless a detector has a reason for it, so a server keeps applying its own `generation_config`. The one exception is Qwen on SGLang: Qwen publishes **0.6** for thinking mode, checkpoints commonly ship `1.0` in `generation_config`, and Pi names no temperature of its own — so `1.0` is what actually gets served. At that temperature a thinking model in an agent loop is prone to re-planning the same task until it runs out of budget. Detecting `model_type: qwen*` with a reasoning parser configured therefore sets `temperature: 0.6`, and no other family is guessed at.
+
+Any model's temperature can be set by hand from **✎ Edit model capabilities**, including back to "server default" by clearing it — like the other overrides there, until the next **↺ Refresh**.
+
+A related sharp edge: a reported size of `0` means "not reported", not a zero-byte model. SGLang's Ollama shim sends `size: 0` for the very model it is serving. Detectors drop a zero rather than storing it, and the model list ignores one that a pre-existing config still carries, so neither shows up as `0.0G`.
 
 ## API key storage
 

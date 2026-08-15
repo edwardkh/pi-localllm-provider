@@ -23,6 +23,7 @@ export type ApiType =
   | "lmstudio"
   | "llamacpp"
   | "ollama"
+  | "sglang"
   | "vllm"
   | "ds4"
   | "openai";
@@ -47,6 +48,10 @@ export interface DiscoveredModel {
   // getSupportedThinkingLevels drops any level mapped to null, and hides
   // "xhigh"/"max" entirely unless they have an entry here.
   thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
+  // Merged into every request by Pi. Only set where a detector knows the
+  // model family's published recommendation and the server would otherwise
+  // fall back to a generation_config default that suits it badly.
+  samplingParams?: { temperature?: number };
 }
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -140,8 +145,22 @@ async function postJson<T>(
   }
 }
 
-function capTokens(contextWindow: number): number {
-  return Math.min(Math.floor(contextWindow / 2), 8192);
+// The fallback for backends that don't report an output limit of their own.
+//
+// This is a real generation cap, not just metadata: Pi resolves every turn's
+// max_tokens as `options.maxTokens ?? model.maxTokens` (pi-ai's
+// buildBaseOptions), clamped to the context left after the prompt.
+//
+// The ceiling is much higher for a reasoning model because reasoning and the
+// answer come out of the same budget, and no local backend offers a separate
+// thinking cap worth relying on — SGLang's OpenAI surface silently ignores
+// max_thinking_tokens, and Pi's thinking_token_budget is vLLM-only. Set this
+// too low and a model that thinks its way to the limit spends the entire
+// budget reasoning and returns no answer at all, which then reads as a
+// truncated turn and gets retried into the same wall. The cost of the
+// opposite mistake is only a slower failure, so the generous side wins.
+function capTokens(contextWindow: number, reasoning = false): number {
+  return Math.min(Math.floor(contextWindow / 2), reasoning ? 65536 : 8192);
 }
 
 // ─── MTPLX ──────────────────────────────────────────────────────────
@@ -179,7 +198,7 @@ export async function detectMtplx(
         id: health.model,
         name: health.model.split("/").pop() ?? health.model,
         contextWindow: health.context_window,
-        maxTokens: health.max_response_tokens ?? capTokens(health.context_window),
+        maxTokens: health.max_response_tokens ?? capTokens(health.context_window, reasoning),
         reasoning,
         input: vision ? ["text", "image"] : ["text"],
       },
@@ -222,11 +241,11 @@ export async function detectOmlx(
       id: m.id,
       name: m.model_alias || m.display_name || m.id,
       contextWindow,
-      maxTokens: m.max_tokens ?? capTokens(contextWindow),
+      maxTokens: m.max_tokens ?? capTokens(contextWindow, m.thinking_default === true),
       reasoning: m.thinking_default === true,
       input: type === "vlm" ? ["text", "image"] : ["text"],
       loaded: m.loaded === true,
-      sizeBytes: m.estimated_size,
+      sizeBytes: firstNumber(m.estimated_size),
     });
   }
   return models.length > 0 ? { apiType: "omlx", models } : null;
@@ -265,11 +284,11 @@ export async function detectLmStudio(
       id: m.key,
       name: m.display_name || m.key,
       contextWindow,
-      maxTokens: capTokens(contextWindow),
+      maxTokens: capTokens(contextWindow, !!m.capabilities?.reasoning),
       reasoning: !!m.capabilities?.reasoning,
       input: m.capabilities?.vision || type === "vlm" ? ["text", "image"] : ["text"],
       loaded: (m.loaded_instances?.length ?? 0) > 0,
-      sizeBytes: m.size_bytes,
+      sizeBytes: firstNumber(m.size_bytes),
       quantization: m.quantization?.name,
     });
   }
@@ -321,7 +340,7 @@ export async function detectLlamaCpp(
         maxTokens: capTokens(contextWindow),
         reasoning: false,
         input: props.modalities?.vision ? ["text", "image"] : ["text"],
-        sizeBytes: entry?.meta?.size,
+        sizeBytes: firstNumber(entry?.meta?.size),
       },
     ],
   };
@@ -385,16 +404,266 @@ export async function detectOllama(
       id: m.model,
       name: m.name,
       contextWindow,
-      maxTokens: capTokens(contextWindow),
+      maxTokens: capTokens(contextWindow, capabilities.includes("thinking")),
       reasoning: capabilities.includes("thinking"),
       input: capabilities.includes("vision") ? ["text", "image"] : ["text"],
       loaded: runningModels.has(m.model),
-      sizeBytes: m.size,
+      sizeBytes: firstNumber(m.size),
       quantization: m.details?.quantization_level,
     };
   });
 
   return { apiType: "ollama", models };
+}
+
+// ─── SGLang ──────────────────────────────────────────────────────────
+// Must be probed *before* Ollama, not after: SGLang ships an Ollama
+// compatibility shim, so its /api/tags and /api/show answer 200 with
+// Ollama-shaped payloads and detectOllama would otherwise claim it. The
+// shim is lossy in three ways, which is what makes the mislabel worth
+// preventing rather than just cosmetic:
+//   - /api/show reports capabilities: ["completion"] no matter what the
+//     model can do, so vision and reasoning both come back false.
+//   - /api/ps isn't implemented (404), so every model looks not-loaded
+//     when SGLang in fact holds one resident model for the process's life.
+//   - the shim's ids are the raw --model-path, same as /v1/models.
+// Two SGLang-only endpoints carry the real answers:
+//   - /get_model_info: has_image_understanding (the vision signal) plus
+//     is_generation, which separates a chat server from an embedding one.
+//   - /get_server_info: reasoning_parser, non-null exactly when SGLang was
+//     started with a parser that splits reasoning out of the response —
+//     which is the only sense in which "this server does reasoning" is
+//     true or false, independent of the weights.
+// The context window comes from /v1/models' max_model_len, the same field
+// vLLM publishes; /get_server_info's context_length is the CLI override and
+// is null unless it was passed explicitly, so it can't be relied on.
+//
+// compat and thinkingLevelMap are measured, not assumed — see the probe
+// below for why they can't be hard-coded the way ds4's are.
+
+// ─── SGLang request-compat probe ────────────────────────────────────
+// Unlike ds4, SGLang's accepted reasoning_effort values can't be read off
+// its source, because they aren't SGLang's. SGLang validates the field
+// against all seven OpenAI tiers and then hands the string straight to the
+// model's chat template (serving_chat.py builds extra_template_kwargs
+// ["reasoning_effort"]), and it is the template that accepts or rejects it.
+// The vocabularies genuinely differ per model: a Qwen3.8 template answers
+// 400 with "Supported types are xhigh (default), medium, and low", while
+// SGLang's own Kimi K3 path recognises low/high/max instead. Hard-coding
+// either set would 400 every request on a server running the other.
+//
+// So the tiers are measured: one throwaway completion per tier, capped at a
+// single token. A rejected tier fails during template rendering, before any
+// generation, so the cost of the whole sweep is one token per *accepted*
+// tier. The same trick settles the developer role, which is a second
+// template-level question SGLang's API layer can't answer — it accepts the
+// role in its own schema (protocol.py's _GenericMessageRole lists it) and
+// still lets a template that only knows "system" reject the message.
+//
+// Anything short of a clean HTTP answer leaves compat unset, so a server
+// that is slow, busy, or unreachable degrades to the safe defaults rather
+// than to a guess.
+
+const THINKING_TIERS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+// Pi's levels in the same order, so "nearest" can be measured by index.
+// "off" is handled separately: it means stop reasoning, so it may only ever
+// map to "none" — never to whatever tier happens to sit closest to it.
+const PI_LEVELS: readonly ThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+async function probeStatus(
+  url: string,
+  apiKey: string,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<number | null> {
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: signal ?? AbortSignal.timeout(STANDALONE_PROBE_TIMEOUT_MS),
+    });
+    // Drain the body so the socket can be reused by the probes still in
+    // flight; the status is the only part that matters here.
+    await res.text().catch(() => "");
+    return res.status;
+  } catch {
+    return null;
+  }
+}
+
+// Picks the accepted tier closest to `level`, preferring the weaker one when
+// two are equally close — a request for more thinking than the model offers
+// should land under the ceiling rather than over it. "none" is excluded: it
+// disables reasoning, so it must never be the nearest match for a level that
+// asked for some.
+export function nearestTier(level: ThinkingLevel, accepted: readonly string[]): string | undefined {
+  const wanted = PI_LEVELS.indexOf(level);
+  if (wanted < 0) return undefined;
+  const candidates = THINKING_TIERS.map((tier, i) => ({ tier, i })).filter(
+    (c) => c.tier !== "none" && accepted.includes(c.tier),
+  );
+  let best: { tier: string; i: number } | undefined;
+  for (const c of candidates) {
+    if (!best || Math.abs(c.i - wanted) < Math.abs(best.i - wanted)) best = c;
+  }
+  return best?.tier;
+}
+
+export interface SglangRequestCompat {
+  compat?: DiscoveredModel["compat"];
+  thinkingLevelMap?: DiscoveredModel["thinkingLevelMap"];
+}
+
+export async function probeSglangRequestCompat(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  signal?: AbortSignal,
+): Promise<SglangRequestCompat> {
+  const url = `${baseUrl}/chat/completions`;
+  const base = { model: modelId, max_tokens: 1, stream: false };
+  const user = { role: "user", content: "hi" };
+
+  const [tierStatuses, developerStatus] = await Promise.all([
+    Promise.all(
+      THINKING_TIERS.map((tier) =>
+        probeStatus(url, apiKey, { ...base, messages: [user], reasoning_effort: tier }, signal),
+      ),
+    ),
+    probeStatus(
+      url,
+      apiKey,
+      { ...base, messages: [{ role: "developer", content: "You are terse." }, user] },
+      signal,
+    ),
+  ]);
+
+  // Only a 200 or a request-rejected status is the server actually answering
+  // the question. A timeout, a 429, a 5xx from an overloaded worker — those
+  // are the question going unheard, and scoring them as "tier unsupported"
+  // is the one failure mode that does lasting damage: it writes a map that
+  // looks measured, gets saved, and then 400s on every real request until
+  // the next Refresh happens to catch the server in a better mood. One
+  // unanswered tier poisons the whole sweep, so the bar is all-or-nothing.
+  const isDefinitive = (s: number | null) => s === 200 || s === 400 || s === 422;
+  if (!tierStatuses.every(isDefinitive)) return {};
+
+  const accepted = THINKING_TIERS.filter((_, i) => tierStatuses[i] === 200);
+
+  const result: SglangRequestCompat = {};
+  if (accepted.length > 0) {
+    // The developer probe is held to a lower bar because its unknown state
+    // is already the safe one: false just means Pi keeps sending "system".
+    result.compat = { supportsReasoningEffort: true, supportsDeveloperRole: developerStatus === 200 };
+
+    const map: Partial<Record<ThinkingLevel, string>> = {};
+    // Only claim "off" when the server really has an off switch; otherwise
+    // leave it unmapped, which makes Pi omit the field and fall back to
+    // whatever the model does by default.
+    if (accepted.includes("none")) map.off = "none";
+    for (const level of PI_LEVELS) {
+      if (level === "off") continue;
+      const tier = nearestTier(level, accepted);
+      if (tier) map[level] = tier;
+    }
+    if (Object.keys(map).length > 0) result.thinkingLevelMap = map;
+  } else if (developerStatus === 200) {
+    result.compat = { supportsDeveloperRole: true };
+  }
+  return result;
+}
+
+// Qwen publishes 0.6 as the sampling temperature for its thinking mode, but a
+// checkpoint's generation_config commonly ships 1.0, and that is what SGLang
+// serves when the request names no temperature of its own — as Pi's do not.
+// At 1.0 a thinking model in an agent loop is prone to re-planning the same
+// task over and over until it exhausts the token budget, so the published
+// value is applied for the family it belongs to. Any other family keeps its
+// server-side default: this is a known recommendation, not a house style, and
+// guessing one for an unfamiliar model would be worse than leaving it alone.
+// Overridable per model from the TUI.
+const QWEN_THINKING_TEMPERATURE = 0.6;
+
+function samplingParamsFor(modelType: string | undefined, reasoning: boolean) {
+  if (!reasoning || !modelType) return undefined;
+  return /^qwen/i.test(modelType) ? { temperature: QWEN_THINKING_TEMPERATURE } : undefined;
+}
+
+interface SglangModelInfo {
+  model_path?: string;
+  is_generation?: boolean;
+  has_image_understanding?: boolean;
+  model_type?: string;
+}
+
+interface SglangServerInfo {
+  reasoning_parser?: string | null;
+}
+
+interface SglangModels {
+  data?: Array<{ id: string; max_model_len?: number }>;
+}
+
+export async function detectSglang(
+  root: string,
+  baseUrl: string,
+  apiKey: string,
+  signal?: AbortSignal,
+  diagnostics?: ProbeDiagnostic[],
+): Promise<DetectResult | null> {
+  const info = await fetchJson<SglangModelInfo>(`${root}/get_model_info`, apiKey, signal, diagnostics);
+  // is_generation false means an embedding-only server: it has no chat
+  // endpoint to register, so let it fall through rather than claiming it.
+  if (!info?.model_path || info.is_generation !== true) return null;
+
+  const [serverInfo, modelsRes] = await Promise.all([
+    fetchJson<SglangServerInfo>(`${root}/get_server_info`, apiKey, signal, diagnostics),
+    fetchJson<SglangModels>(`${baseUrl}/models`, apiKey, signal, diagnostics),
+  ]);
+
+  const reasoning = typeof serverInfo?.reasoning_parser === "string" && serverInfo.reasoning_parser !== "";
+  const vision = info.has_image_understanding === true;
+  // One resident model per process, so /v1/models is a single entry in
+  // practice — mapped anyway so a multi-model build doesn't lose entries.
+  const entries = modelsRes?.data?.length ? modelsRes.data : [{ id: info.model_path }];
+
+  // Only worth measuring when a parser is configured: without one SGLang
+  // never separates reasoning from the answer, so the levels have nothing
+  // to steer even where the template would accept them. One sweep serves
+  // every entry, since they all resolve to the same resident model.
+  const requestCompat = reasoning
+    ? await probeSglangRequestCompat(baseUrl, apiKey, entries[0].id, signal)
+    : {};
+  const samplingParams = samplingParamsFor(info.model_type, reasoning);
+
+  return {
+    apiType: "sglang",
+    models: entries.map((m) => {
+      const contextWindow = firstNumber((m as { max_model_len?: number }).max_model_len) ?? 32768;
+      return {
+        id: m.id,
+        name: m.id.split(/[\\/]/).filter(Boolean).pop() ?? m.id,
+        contextWindow,
+        maxTokens: capTokens(contextWindow, reasoning),
+        reasoning,
+        input: (vision ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+        ...requestCompat,
+        ...(samplingParams ? { samplingParams } : {}),
+      };
+    }),
+  };
 }
 
 // ─── vLLM ────────────────────────────────────────────────────────────
@@ -570,7 +839,7 @@ export async function detectOpenAI(
           maxTokens:
             declaredMax !== undefined && declaredMax < contextWindow
               ? declaredMax
-              : capTokens(contextWindow),
+              : capTokens(contextWindow, true),
           reasoning: true,
           input: ["text"] as ("text" | "image")[],
           compat: { supportsReasoningEffort: true, supportsDeveloperRole: true },
@@ -591,23 +860,26 @@ export async function detectOpenAI(
           m.context_length,
         ) ?? 32768;
 
+      const params = m.supported_parameters ?? [];
+      const modalities = m.architecture?.input_modalities ?? [];
+      const reasoning = params.includes("reasoning_effort") || params.includes("include_reasoning");
+
       // A declared output ceiling is only trusted when it is a real
       // restriction. Cards that repeat the whole context window here mean
       // "no separate output limit", and taking that literally would make
       // every request reserve the entire window for the response.
       const declaredMax = firstNumber(m.top_provider?.max_completion_tokens);
       const maxTokens =
-        declaredMax !== undefined && declaredMax < contextWindow ? declaredMax : capTokens(contextWindow);
-
-      const params = m.supported_parameters ?? [];
-      const modalities = m.architecture?.input_modalities ?? [];
+        declaredMax !== undefined && declaredMax < contextWindow
+          ? declaredMax
+          : capTokens(contextWindow, reasoning);
 
       return {
         id: m.id,
         name: m.name || (m.id.split("/").pop() ?? m.id),
         contextWindow,
         maxTokens,
-        reasoning: params.includes("reasoning_effort") || params.includes("include_reasoning"),
+        reasoning,
         input: (modalities.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
       };
     }),
@@ -668,6 +940,9 @@ export async function detectModels(
     (await detectOmlx(root, apiKey, chainSignal, diagnostics)) ??
     (await detectLmStudio(root, apiKey, chainSignal, diagnostics)) ??
     (await detectLlamaCpp(root, apiKey, chainSignal, diagnostics)) ??
+    // Ahead of Ollama on purpose — SGLang answers /api/tags through a
+    // compatibility shim and would otherwise be claimed as Ollama.
+    (await detectSglang(root, baseUrl, apiKey, chainSignal, diagnostics)) ??
     (await detectOllama(root, apiKey, chainSignal, diagnostics)) ??
     (await detectVllm(root, baseUrl, apiKey, chainSignal, diagnostics)) ??
     (await detectOpenAI(baseUrl, apiKey, chainSignal, diagnostics));
