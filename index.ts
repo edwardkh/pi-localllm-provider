@@ -95,6 +95,7 @@ function apiTypeLabel(apiType: ApiType): string {
     case "sglang": return "SGLang";
     case "vllm": return "vLLM";
     case "ds4": return "ds4";
+    case "ninfer": return "NInfer";
     case "openai": return "OpenAI-compatible";
   }
 }

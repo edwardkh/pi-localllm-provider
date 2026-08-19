@@ -26,6 +26,7 @@ export type ApiType =
   | "sglang"
   | "vllm"
   | "ds4"
+  | "ninfer"
   | "openai";
 
 export interface DiscoveredModel {
@@ -441,9 +442,10 @@ export async function detectOllama(
 // compat and thinkingLevelMap are measured, not assumed — see the probe
 // below for why they can't be hard-coded the way ds4's are.
 
-// ─── SGLang request-compat probe ────────────────────────────────────
-// Unlike ds4, SGLang's accepted reasoning_effort values can't be read off
-// its source, because they aren't SGLang's. SGLang validates the field
+// ─── Request-compat probe ───────────────────────────────────────────
+// Shared by SGLang and ninfer, because the problem is shared: neither
+// backend's accepted reasoning_effort values can be read off its source,
+// because they aren't the backend's. SGLang validates the field
 // against all seven OpenAI tiers and then hands the string straight to the
 // model's chat template (serving_chat.py builds extra_template_kwargs
 // ["reasoning_effort"]), and it is the template that accepts or rejects it.
@@ -479,28 +481,44 @@ const PI_LEVELS: readonly ThinkingLevel[] = [
   "max",
 ];
 
-async function probeStatus(
+/** A probe's answer: the status, and whatever the server said about it. */
+interface ProbeReply {
+  status: number;
+  body: string;
+}
+
+async function probe(
   url: string,
   apiKey: string,
-  body: unknown,
+  payload: unknown,
   signal?: AbortSignal,
-): Promise<number | null> {
+): Promise<ProbeReply | null> {
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
     const res = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: signal ?? AbortSignal.timeout(STANDALONE_PROBE_TIMEOUT_MS),
     });
-    // Drain the body so the socket can be reused by the probes still in
-    // flight; the status is the only part that matters here.
-    await res.text().catch(() => "");
-    return res.status;
+    // Always drained, so the socket can be reused by the probes still in
+    // flight. Some probes only want the status; ninfer's context probe reads
+    // the ceiling out of the rejection message.
+    const body = await res.text().catch(() => "");
+    return { status: res.status, body };
   } catch {
     return null;
   }
+}
+
+async function probeStatus(
+  url: string,
+  apiKey: string,
+  payload: unknown,
+  signal?: AbortSignal,
+): Promise<number | null> {
+  return (await probe(url, apiKey, payload, signal))?.status ?? null;
 }
 
 // Picks the accepted tier closest to `level`, preferring the weaker one when
@@ -521,17 +539,17 @@ export function nearestTier(level: ThinkingLevel, accepted: readonly string[]): 
   return best?.tier;
 }
 
-export interface SglangRequestCompat {
+export interface RequestCompat {
   compat?: DiscoveredModel["compat"];
   thinkingLevelMap?: DiscoveredModel["thinkingLevelMap"];
 }
 
-export async function probeSglangRequestCompat(
+export async function probeRequestCompat(
   baseUrl: string,
   apiKey: string,
   modelId: string,
   signal?: AbortSignal,
-): Promise<SglangRequestCompat> {
+): Promise<RequestCompat> {
   const url = `${baseUrl}/chat/completions`;
   const base = { model: modelId, max_tokens: 1, stream: false };
   const user = { role: "user", content: "hi" };
@@ -562,7 +580,7 @@ export async function probeSglangRequestCompat(
 
   const accepted = THINKING_TIERS.filter((_, i) => tierStatuses[i] === 200);
 
-  const result: SglangRequestCompat = {};
+  const result: RequestCompat = {};
   if (accepted.length > 0) {
     // The developer probe is held to a lower bar because its unknown state
     // is already the safe one: false just means Pi keeps sending "system".
@@ -644,7 +662,7 @@ export async function detectSglang(
   // to steer even where the template would accept them. One sweep serves
   // every entry, since they all resolve to the same resident model.
   const requestCompat = reasoning
-    ? await probeSglangRequestCompat(baseUrl, apiKey, entries[0].id, signal)
+    ? await probeRequestCompat(baseUrl, apiKey, entries[0].id, signal)
     : {};
   const samplingParams = samplingParamsFor(info.model_type, reasoning);
 
@@ -806,6 +824,217 @@ function firstNumber(...values: unknown[]): number | undefined {
 //   - "minimal"/"low"/"medium"/"high" pass through unmapped. ds4 accepts all
 //     four strings and treats them as HIGH, which is as close as it gets.
 
+// ─── ninfer (Neroued/ninfer) ────────────────────────────────────────
+// Identified the same way ds4 is, and for the same reason: it publishes no
+// endpoint of its own to probe. Its five GET routes are /health,
+// /v1/models, /v1/models/{id} and two Responses lookups, and /health answers
+// a bare {"status":"ok"} — which is also why detectMtplx, the only other
+// probe that reads /health, passes over it. The marker is in the model card
+// src/serve/openai_schema.cpp hard-codes: `"owned_by": "ninfer"`.
+//
+// Where ds4's card at least carries a context window, ninfer's carries
+// nothing but {id, object, created, owned_by}. Everything else this
+// extension needs is a startup flag with no runtime reader:
+//
+//   --max-context   the context ceiling, default 8192
+//   --vision        media input, off unless passed
+//   the artifact's chat_template.jinja, which decides the effort tiers
+//
+// So they are measured. Each probe below is chosen to cost nothing on the
+// GPU; the notes on each say why that holds and what still needs checking
+// against a running server.
+
+const NINFER_OWNER = "ninfer";
+
+export function isNinferCards(cards: OpenAIModelCard[]): boolean {
+  return cards.length > 0 && cards.every((m) => m.owned_by === NINFER_OWNER);
+}
+
+/**
+ * What ninfer uses when --max-context is omitted.
+ *
+ * The fallback if the probe cannot answer, and a far better guess than this
+ * file's generic 32768: registering four times the real ceiling would let Pi
+ * fill a context that the server then refuses.
+ */
+const NINFER_DEFAULT_CONTEXT = 8192;
+
+/**
+ * How far to overshoot when asking the server for its ceiling.
+ *
+ * The prompt has to exceed --max-context for the rejection to happen at all,
+ * and the rejection is the only thing that names the number. Overshooting
+ * costs nothing: engine.cpp raises ContextLengthExceeded straight after the
+ * chat template and tokenizer, before any prefill. Falling short is what
+ * costs — the request would be accepted and actually run.
+ *
+ * 300k clears every context these artifacts ship with, the largest being
+ * 262144. A server configured beyond that accepts the prompt instead, and
+ * then its own reported prompt_tokens becomes a floor — less precise than
+ * the rejection, but true, and it costs nothing extra since that prefill
+ * has already been paid for by the time the answer comes back.
+ *
+ * The ratio is measured: "x " repeated 25,000 times came back as 25,052
+ * prompt tokens on a Qwen3.8 artifact, so two characters per token holds.
+ * The whole detection, this 600 KB body included, took 367 ms.
+ */
+const NINFER_CONTEXT_PROBE_TOKENS = 300_000;
+const NINFER_PROBE_CHARS_PER_TOKEN = 2;
+
+/**
+ * Read the ceiling out of a rejection.
+ *
+ * engine.cpp builds it as "prepared prompt has N tokens, exceeding Engine
+ * max_context M", and the HTTP layer passes exception.what() through as the
+ * error message. Parsing prose is brittle by nature, so a miss returns
+ * undefined and the caller falls back rather than inventing a number.
+ */
+export function parseNinferContext(body: string): number | undefined {
+  const match = /max_context\s+(\d+)/.exec(body);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * The prompt size a server accepted, which is a floor on its ceiling.
+ *
+ * Only reached when the overshoot was not enough — a context larger than
+ * NINFER_CONTEXT_PROBE_TOKENS. Understating it would be worse than useless
+ * there: the prefill has already run, and falling back to 8192 would throw
+ * away the one number that outing bought.
+ */
+function acceptedPromptTokens(reply: ProbeReply): number | undefined {
+  if (reply.status !== 200) return undefined;
+  try {
+    const tokens = (JSON.parse(reply.body) as { usage?: { prompt_tokens?: number } }).usage
+      ?.prompt_tokens;
+    return typeof tokens === "number" && tokens > 0 ? tokens : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface NinferProbe {
+  contextWindow: number;
+  /** Undefined when the vision probe could not be answered either way. */
+  vision?: boolean;
+}
+
+/**
+ * Ask a ninfer server the two things its model card leaves out.
+ *
+ * Both probes are shaped to do no GPU work:
+ *
+ *   - the context probe is rejected during prompt preparation, before
+ *     prefill, and names the ceiling as it goes;
+ *   - the vision probe is a token count, which the docs say runs "without
+ *     running GPU generation" and which media requests fail with 400
+ *     `vision_disabled` when --vision was omitted.
+ */
+export async function probeNinfer(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  signal?: AbortSignal,
+): Promise<NinferProbe> {
+  const oversized = "x ".repeat(
+    Math.ceil((NINFER_CONTEXT_PROBE_TOKENS * NINFER_PROBE_CHARS_PER_TOKEN) / 2),
+  );
+
+  const [context, vision] = await Promise.all([
+    probe(
+      `${baseUrl}/chat/completions`,
+      apiKey,
+      { model: modelId, max_tokens: 1, stream: false, messages: [{ role: "user", content: oversized }] },
+      signal,
+    ),
+    // A 1x1 transparent PNG: the smallest thing that is still an image.
+    // A server without --vision answers 400 with code `vision_disabled` and
+    // the message "Vision is disabled for this server"; the code is what
+    // gets matched, since the prose is the part free to change.
+    probe(
+      `${baseUrl}/responses/input_tokens`,
+      apiKey,
+      {
+        model: modelId,
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_image",
+                image_url:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+              },
+            ],
+          },
+        ],
+      },
+      signal,
+    ),
+  ]);
+
+  return {
+    contextWindow:
+      (context && parseNinferContext(context.body)) ??
+      (context && acceptedPromptTokens(context)) ??
+      NINFER_DEFAULT_CONTEXT,
+    // Only a definite answer counts. A network failure, or a rejection for
+    // some reason other than vision being off, leaves this unknown so the
+    // caller can fall back rather than declare a vision model text-only.
+    vision:
+      vision === null
+        ? undefined
+        : vision.status === 200
+          ? true
+          : /vision_disabled/.test(vision.body)
+            ? false
+            : undefined,
+  };
+}
+
+/**
+ * Build the models a ninfer server serves.
+ *
+ * Its card lists exactly one entry — one resident artifact per process — but
+ * it is mapped rather than indexed, so a build that ever lists more does not
+ * silently lose them.
+ */
+async function ninferModels(
+  cards: OpenAIModelCard[],
+  baseUrl: string,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<DiscoveredModel[]> {
+  const [measured, compat] = await Promise.all([
+    probeNinfer(baseUrl, apiKey, cards[0].id, signal),
+    // The same probe SGLang uses, because the situation is the same: the
+    // accepted tiers come from the artifact's chat template, and an
+    // unsupported one is rejected — 400 `reasoning_effort_not_supported`
+    // here. docs/serving.md says an effort-capable template exposes low,
+    // medium and xhigh, which is the set Qwen3.8 exposes under SGLang too;
+    // measuring rather than hard-coding is what keeps that from being an
+    // assumption about every artifact ninfer will ever load.
+    probeRequestCompat(baseUrl, apiKey, cards[0].id, signal),
+  ]);
+
+  // Thinking is what the effort tiers steer, so a template that exposes any
+  // of them is a reasoning model. Reasoning text comes back on a separate
+  // `reasoning_content` field, which Pi reads without further help.
+  const reasoning = Boolean(compat.thinkingLevelMap);
+
+  return cards.map((card) => ({
+    id: card.id,
+    name: card.name || (card.id.split(/[\\/]/).filter(Boolean).pop() ?? card.id),
+    contextWindow: measured.contextWindow,
+    maxTokens: capTokens(measured.contextWindow, reasoning),
+    reasoning,
+    input: (measured.vision ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+    ...compat,
+  }));
+}
+
 const DS4_OWNER = "ds4.c";
 
 const DS4_THINKING_LEVELS: Partial<Record<ThinkingLevel, string | null>> = {
@@ -825,6 +1054,12 @@ export async function detectOpenAI(
 ): Promise<DetectResult> {
   const res = await fetchJson<OpenAIModels>(`${baseUrl}/models`, apiKey, signal, diagnostics);
   if (!res?.data?.length) return { apiType: "openai", models: [] };
+
+  // Checked before ds4 only because both are owned_by markers on the same
+  // payload; neither can match the other's value, so the order is arbitrary.
+  if (isNinferCards(res.data)) {
+    return { apiType: "ninfer", models: await ninferModels(res.data, baseUrl, apiKey, signal) };
+  }
 
   if (isDs4Cards(res.data)) {
     return {

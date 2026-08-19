@@ -1,6 +1,6 @@
 # pi-localllm-provider
 
-A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, SGLang, ds4, or anything else with an OpenAI-compatible API.
+A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, SGLang, ds4, ninfer, or anything else with an OpenAI-compatible API.
 
 - **One command, one place** — `/localllm` is a single TUI menu for adding, inspecting, and managing every local server's integration with Pi — no subcommands, no hand-editing `settings.json`.
 - **Reads the server, doesn't guess** — context window, reasoning, vision, size, quantization: pulled from real backend APIs across 7 detection paths, not typed into a config file and hoped correct.
@@ -96,9 +96,10 @@ No — every configured server re-registers automatically on startup.
 | Ollama (native API) | `/api/tags` + `/api/show` per model + `/api/ps` | context window, reasoning, vision, size, quantization, loaded state |
 | vLLM | `GET /version` + `/v1/models` | context window only — see note |
 | ds4 | `GET /v1/models` with `owned_by: "ds4.c"` | context window, max tokens, reasoning, request compat — see note |
+| ninfer | `GET /v1/models` with `owned_by: "ninfer"` | context window, reasoning, vision, request compat — all measured, see note |
 | OpenAI-compatible | `GET /v1/models` | context window from `max_model_len`, `top_provider.context_length`, `context_window` or `context_length`; name, reasoning and vision from an OpenRouter-style card |
 
-Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM, SGLang, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
+Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM, SGLang, ninfer, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
 
 **SGLang is probed before Ollama, and the order matters.** SGLang ships an Ollama compatibility shim, so its `/api/tags` and `/api/show` answer with Ollama-shaped payloads — enough for the Ollama probe to claim it if it got there first. The shim is lossy in three ways that all read as a working setup, which is what makes the mislabel worth preventing:
 
@@ -148,6 +149,24 @@ vLLM's `/v1/models` never carries reasoning or vision data; its detector exists 
 Flipping `reasoning` to `true` (auto-detected or by hand) only changes how *responses* are parsed. This extension disables Pi's OpenAI o1-style reasoning-model conventions — the `reasoning_effort` request param and `developer`-role system prompts — by default for every model it registers, since most detection paths above can't confirm the server speaks either convention. So toggling reasoning on is safe to try even against a server that doesn't really support it: nothing about the outgoing request changes because of it.
 
 ds4 is the one exception, and only because both conventions were confirmed in its source: it parses `reasoning_effort` on the chat path, and accepts the `developer` role wherever it accepts `system`. Both are enabled for `[ds4]` models, which is what lets Pi's thinking levels actually reach the server. Hand-edited models and servers configured before this existed keep the safe defaults.
+
+### ninfer publishes nothing, so everything is measured
+
+Written from [Neroued/ninfer](https://github.com/Neroued/ninfer) at `master` and then checked against a running one. Every number below was measured; the file citations are where each probe came from.
+
+ninfer is identified the way ds4 is, by a hard-coded owner on the model card — `"owned_by": "ninfer"` in `src/serve/openai_schema.cpp`. It has no endpoint of its own to probe: its five GET routes are `/health`, `/v1/models`, `/v1/models/{id}` and two Responses lookups, and `/health` answers a bare `{"status":"ok"}`, which is also why the MTPLX probe — the only other one that reads `/health` — passes over it.
+
+Where ds4's card at least carries a context window, ninfer's carries nothing beyond `{id, object, created, owned_by}`. Everything else is a startup flag with no runtime reader: `--max-context` (default **8192**), `--vision` (off unless passed), and the artifact's own `chat_template.jinja`, which decides the reasoning tiers. Registering this extension's generic 32768 fallback would claim four times the real ceiling on a default server and let Pi fill a context it would then be refused.
+
+So three things are measured, each shaped to cost nothing on the GPU:
+
+- **Context window.** A deliberately oversized prompt is rejected during prompt preparation, before any prefill, and the rejection names the ceiling: `src/runtime/engine/engine.cpp` builds `"prepared prompt has N tokens, exceeding Engine max_context M"`. Overshooting is free; falling short is not, because a prompt that fits would be accepted and actually run — so if one is accepted anyway, its reported `prompt_tokens` is kept as a floor rather than discarded. The probe aims 300k tokens past the largest context these artifacts ship with, and two characters per token is measured, not assumed: `"x "` × 25,000 came back as 25,052 prompt tokens. Where nothing can be parsed at all, the fallback is ninfer's own 8192 rather than this file's 32768.
+- **Vision.** A token count carrying a 1×1 PNG. `docs/serving.md` says media requests *and token-count requests* fail with 400 `vision_disabled` when `--vision` was omitted, and that the count endpoints run "without running GPU generation" — so the answer costs nothing whichever way it goes. A rejection for any other reason leaves vision unknown rather than declaring a vision model text-only.
+- **Reasoning tiers.** The same probe SGLang uses, because the situation is the same: the accepted values come from the loaded artifact's chat template, and an unsupported one is rejected — 400 `reasoning_effort_not_supported` here. A Qwen3.8 artifact accepts `none`, `low`, `medium` and `xhigh` and rejects `minimal`, `high` and `max` — the same set that artifact exposes under SGLang, reached through a completely different server. Measuring rather than writing it down is what keeps that from becoming an assumption about every artifact ninfer will ever load.
+
+The `developer` role works, so it is enabled rather than left at the safe default. Reasoning comes back on a separate `reasoning_content` field, which Pi reads without help. And the Chat Completions `usage` object carries only `prompt_tokens`, `completion_tokens` and `total_tokens` — no `completion_tokens_details.reasoning_tokens` — so anything wanting a thinking/answer split has to infer it from the stream.
+
+The whole detection, 600 KB probe body included, takes under 400 ms.
 
 ### Thinking levels on ds4
 

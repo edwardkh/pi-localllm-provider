@@ -9,8 +9,11 @@ import {
   detectOpenAI,
   detectSglang,
   detectVllm,
+  isNinferCards,
   nearestTier,
-  probeSglangRequestCompat,
+  parseNinferContext,
+  probeNinfer,
+  probeRequestCompat,
 } from "./detect.ts";
 
 function mockFetch(routes: Record<string, unknown>) {
@@ -447,10 +450,10 @@ describe("nearestTier", () => {
   });
 });
 
-describe("probeSglangRequestCompat", () => {
+describe("probeRequestCompat", () => {
   it("reproduces the map hand-verified against a Qwen3.8 server", async () => {
     mockSglangProbe(QWEN38_STATUSES);
-    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    const result = await probeRequestCompat("http://x/v1", "", "m");
     expect(result).toEqual({
       compat: { supportsReasoningEffort: true, supportsDeveloperRole: false },
       thinkingLevelMap: {
@@ -467,7 +470,7 @@ describe("probeSglangRequestCompat", () => {
 
   it("records the developer role when the template accepts it", async () => {
     mockSglangProbe({ ...QWEN38_STATUSES, __developer__: 200 });
-    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    const result = await probeRequestCompat("http://x/v1", "", "m");
     expect(result.compat?.supportsDeveloperRole).toBe(true);
   });
 
@@ -475,31 +478,31 @@ describe("probeSglangRequestCompat", () => {
   // unmapped is what makes Pi omit the field and take the model's default.
   it("leaves off unmapped when the model cannot disable reasoning", async () => {
     mockSglangProbe({ ...QWEN38_STATUSES, none: 400 });
-    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    const result = await probeRequestCompat("http://x/v1", "", "m");
     expect(result.thinkingLevelMap).not.toHaveProperty("off");
     expect(result.thinkingLevelMap?.medium).toBe("medium");
   });
 
   it("claims nothing when the server rejects every tier", async () => {
     mockSglangProbe({ __developer__: 400 });
-    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+    expect(await probeRequestCompat("http://x/v1", "", "m")).toEqual({});
   });
 
   // The damaging case: a busy server 503s one tier, and scoring that as
   // "unsupported" would save a map that 400s on every later request.
   it("claims nothing when a single tier fails for a reason other than rejection", async () => {
     mockSglangProbe({ ...QWEN38_STATUSES, medium: 503 });
-    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+    expect(await probeRequestCompat("http://x/v1", "", "m")).toEqual({});
   });
 
   it("treats a rate-limited tier as unanswered, not as unsupported", async () => {
     mockSglangProbe({ ...QWEN38_STATUSES, xhigh: 429 });
-    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+    expect(await probeRequestCompat("http://x/v1", "", "m")).toEqual({});
   });
 
   it("still trusts a sweep when only the developer probe fails", async () => {
     mockSglangProbe({ ...QWEN38_STATUSES, __developer__: "network-error" });
-    const result = await probeSglangRequestCompat("http://x/v1", "", "m");
+    const result = await probeRequestCompat("http://x/v1", "", "m");
     expect(result.compat).toEqual({ supportsReasoningEffort: true, supportsDeveloperRole: false });
     expect(result.thinkingLevelMap?.high).toBe("medium");
   });
@@ -516,7 +519,7 @@ describe("probeSglangRequestCompat", () => {
       max: "network-error",
       __developer__: "network-error",
     });
-    expect(await probeSglangRequestCompat("http://x/v1", "", "m")).toEqual({});
+    expect(await probeRequestCompat("http://x/v1", "", "m")).toEqual({});
   });
 });
 
@@ -1104,5 +1107,210 @@ describe("detectModels error summarization", () => {
     const result = await detectModels("http://x/v1", "");
     expect(result.models).toEqual([]);
     expect(result.error).toBeUndefined();
+  });
+});
+
+// ─── ninfer ─────────────────────────────────────────────────────────
+// Written from the source rather than from a running server, so each of
+// these pins an assumption that live testing has to confirm. The exact
+// strings come from Neroued/ninfer at master: src/serve/openai_schema.cpp
+// for the card, src/runtime/engine/engine.cpp for the rejection wording.
+
+function ninferCard(id = "qwen3.8-27b") {
+  return { id, object: "model", created: 1786000000, owned_by: "ninfer" };
+}
+
+/**
+ * Routes the probes ninfer's detector fires. `context` and `vision` are the
+ * replies those two endpoints give; everything else answers 400.
+ */
+function mockNinfer(
+  cards: unknown[],
+  replies: { context?: { status: number; body: string }; vision?: { status: number; body: string } } = {},
+  tiers: Record<string, number> = { none: 200, low: 200, medium: 200, xhigh: 200 },
+) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const reply = (status: number, body: string) =>
+        ({ ok: status === 200, status, text: async () => body, json: async () => ({}) }) as unknown as Response;
+
+      if (u.endsWith("/v1/models")) {
+        return { ok: true, status: 200, json: async () => ({ object: "list", data: cards }) } as unknown as Response;
+      }
+      if (u.endsWith("/responses/input_tokens")) {
+        const v = replies.vision ?? { status: 400, body: '{"error":{"code":"vision_disabled"}}' };
+        return reply(v.status, v.body);
+      }
+      if (u.endsWith("/chat/completions")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        // The compat probe names a tier; the context probe sends a long prompt.
+        if (typeof body.reasoning_effort === "string") {
+          return reply(tiers[body.reasoning_effort] ?? 400, "");
+        }
+        if (body.messages?.some((m: { role: string }) => m.role === "developer")) {
+          return reply(400, '{"error":{"message":"Unexpected message role"}}');
+        }
+        const c = replies.context ?? {
+          status: 400,
+          body: '{"error":{"message":"prepared prompt has 300004 tokens, exceeding Engine max_context 16384"}}',
+        };
+        return reply(c.status, c.body);
+      }
+      return reply(404, "");
+    }),
+  );
+}
+
+describe("parseNinferContext", () => {
+  // The exact body a live ninfer 0.x returned, not a reconstruction.
+  it("reads the ceiling out of a real rejection", () => {
+    const body =
+      '{"error":{"code":"context_length_exceeded","message":"prepared prompt has 25052 tokens, ' +
+      'exceeding Engine max_context 16384","param":"messages","type":"invalid_request_error"}}';
+    expect(parseNinferContext(body)).toBe(16384);
+  });
+
+  // engine.cpp: "prepared prompt has N tokens, exceeding Engine max_context M"
+  it("reads the ceiling out of the rejection", () => {
+    expect(
+      parseNinferContext("prepared prompt has 300004 tokens, exceeding Engine max_context 16384"),
+    ).toBe(16384);
+  });
+
+  it("survives the message arriving wrapped in JSON", () => {
+    expect(parseNinferContext('{"error":{"message":"... Engine max_context 8192"}}')).toBe(8192);
+  });
+
+  // Parsing prose is brittle by nature, so a miss has to fall through to the
+  // caller's fallback rather than invent a number.
+  it("gives up rather than guess", () => {
+    expect(parseNinferContext("context length exceeded")).toBeUndefined();
+    expect(parseNinferContext("")).toBeUndefined();
+    expect(parseNinferContext("max_context none")).toBeUndefined();
+  });
+});
+
+describe("isNinferCards", () => {
+  it("identifies the owner the schema hard-codes", () => {
+    expect(isNinferCards([ninferCard()])).toBe(true);
+  });
+
+  it("stays out of the way of a card that is not ninfer's", () => {
+    expect(isNinferCards([{ id: "m", owned_by: "sglang" }])).toBe(false);
+    expect(isNinferCards([{ id: "m" }])).toBe(false);
+    expect(isNinferCards([])).toBe(false);
+  });
+
+  it("declines a mixed list, as a gateway aggregating backends would send", () => {
+    expect(isNinferCards([ninferCard(), { id: "other", owned_by: "vllm" }])).toBe(false);
+  });
+});
+
+describe("probeNinfer", () => {
+  it("learns the context ceiling from the rejection", async () => {
+    mockNinfer([ninferCard()]);
+    expect((await probeNinfer("http://x/v1", "", "m")).contextWindow).toBe(16384);
+  });
+
+  // Registering four times the real ceiling would let Pi fill a context the
+  // server then refuses, so an unreadable answer falls back to ninfer's own
+  // default rather than this file's generic one.
+  it("falls back to ninfer's default when the rejection says nothing useful", async () => {
+    mockNinfer([ninferCard()], { context: { status: 400, body: "context_length_exceeded" } });
+    expect((await probeNinfer("http://x/v1", "", "m")).contextWindow).toBe(8192);
+  });
+
+  // Only reached on a context larger than the overshoot. The prefill has
+  // already run by then, so throwing away the number it bought and falling
+  // back to 8192 would be the worst of both.
+  it("takes an accepted prompt as a floor when the overshoot was not enough", async () => {
+    mockNinfer([ninferCard()], {
+      context: { status: 200, body: '{"usage":{"prompt_tokens":300004,"completion_tokens":1}}' },
+    });
+    expect((await probeNinfer("http://x/v1", "", "m")).contextWindow).toBe(300004);
+  });
+
+  it("falls back when an accepted probe reports no usable prompt size", async () => {
+    mockNinfer([ninferCard()], { context: { status: 200, body: "not json" } });
+    expect((await probeNinfer("http://x/v1", "", "m")).contextWindow).toBe(8192);
+  });
+
+  it("falls back when the probe never gets an answer", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("connection refused"); }));
+    expect((await probeNinfer("http://x/v1", "", "m")).contextWindow).toBe(8192);
+  });
+
+  it("reads vision off the token-count rejection", async () => {
+    mockNinfer([ninferCard()]);
+    expect((await probeNinfer("http://x/v1", "", "m")).vision).toBe(false);
+  });
+
+  it("reads vision on when the token count is accepted", async () => {
+    mockNinfer([ninferCard()], { vision: { status: 200, body: '{"input_tokens":12}' } });
+    expect((await probeNinfer("http://x/v1", "", "m")).vision).toBe(true);
+  });
+
+  // A rejection for some other reason says nothing about vision, and
+  // declaring a vision model text-only is the worse of the two mistakes.
+  it("leaves vision unknown when the rejection is about something else", async () => {
+    mockNinfer([ninferCard()], { vision: { status: 400, body: '{"error":{"code":"invalid_request"}}' } });
+    expect((await probeNinfer("http://x/v1", "", "m")).vision).toBeUndefined();
+  });
+});
+
+describe("ninfer through the chain", () => {
+  it("is detected, measured, and mapped", async () => {
+    mockNinfer([ninferCard()]);
+    const result = await detectModels("http://x/v1", "");
+
+    expect(result.apiType).toBe("ninfer");
+    expect(result.models[0]).toMatchObject({
+      id: "qwen3.8-27b",
+      contextWindow: 16384,
+      reasoning: true,
+      input: ["text"],
+    });
+  });
+
+  // docs/serving.md: an effort-capable template exposes low, medium and
+  // xhigh; minimal, high and max are parsed and then rejected. That is the
+  // same set Qwen3.8 exposes under SGLang, which is why the probe is shared
+  // rather than either backend's tiers being written down.
+  it("maps Pi's levels onto the tiers the artifact accepts", async () => {
+    mockNinfer([ninferCard()]);
+    const result = await detectModels("http://x/v1", "");
+
+    expect(result.models[0].thinkingLevelMap).toEqual({
+      off: "none",
+      minimal: "low",
+      low: "low",
+      medium: "medium",
+      high: "medium",
+      xhigh: "xhigh",
+      max: "xhigh",
+    });
+  });
+
+  it("reports a text-only artifact as text-only", async () => {
+    mockNinfer([ninferCard()]);
+    const result = await detectModels("http://x/v1", "");
+    expect(result.models[0].input).toEqual(["text"]);
+  });
+
+  it("reports vision when the server was started with it", async () => {
+    mockNinfer([ninferCard()], { vision: { status: 200, body: '{"input_tokens":12}' } });
+    const result = await detectModels("http://x/v1", "");
+    expect(result.models[0].input).toEqual(["text", "image"]);
+  });
+
+  // A template with no effort tiers is not a reasoning model, and nothing
+  // about reasoning should be claimed for it.
+  it("claims no reasoning when the template exposes no tiers", async () => {
+    mockNinfer([ninferCard()], {}, {});
+    const result = await detectModels("http://x/v1", "");
+    expect(result.models[0].reasoning).toBe(false);
+    expect(result.models[0].thinkingLevelMap).toBeUndefined();
   });
 });
