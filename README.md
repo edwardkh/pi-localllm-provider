@@ -27,7 +27,7 @@ cp -r /path/to/pi-localllm-provider/* ~/.pi/agent/extensions/pi-localllm-provide
 ```
 LocalLLM — 2 server(s)
 ──────────────────────────────────────────────────
-  Mac Studio  [oMLX]    (http://192.168.1.50:8000/v1)  2 model(s)
+  Mac Studio  [oMLX]    (http://mac-studio.lan:8000/v1)  2 model(s)
   Ollama      [Ollama]  (http://localhost:11434/v1)    5 model(s)
   ＋ Add server
 ```
@@ -36,7 +36,7 @@ Selecting a server opens its sub-menu with detected metadata per model — no ne
 
 ```
 Mac Studio  [oMLX]
-URL: http://192.168.1.50:8000/v1
+URL: http://mac-studio.lan:8000/v1
 Models:  (✓ = loaded in memory, ○ = will be loaded on first message)
   • ✓ Qwen2.5-Coder-7B-Instruct  (ctx 32k, max 8k, 4.6G)
   • ○ Qwen2.5-Coder-32B-Instruct  (ctx 32k, max 8k, 18.2G, reasoning, vision)
@@ -201,7 +201,7 @@ Stored under the `localllm` key in `~/.pi/agent/settings.json`:
       {
         "id": "a3f7k2",
         "name": "Mac Studio",
-        "baseUrl": "http://192.168.1.50:8000/v1",
+        "baseUrl": "http://mac-studio.lan:8000/v1",
         "apiKey": "",
         "apiType": "omlx",
         "models": [
