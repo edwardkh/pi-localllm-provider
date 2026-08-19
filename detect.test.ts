@@ -618,6 +618,45 @@ describe("detectSglang", () => {
     expect(await detectSglang("http://x", "http://x/v1", "")).toBeNull();
   });
 
+  // SGLang renamed /get_model_info and /get_server_info; the old pair still
+  // answers but logs a deprecation warning naming the replacement. Both
+  // spellings have to detect identically, because a server can be on either
+  // side of the rename and the release that drops the old names would
+  // otherwise make SGLang undetectable rather than merely degraded. The
+  // surrounding tests all mock the legacy names, so those cover the fallback.
+  it("detects a server that serves only the renamed endpoints", async () => {
+    mockFetch({
+      "http://x/model_info": {
+        model_path: "/models/m",
+        is_generation: true,
+        has_image_understanding: true,
+      },
+      "http://x/server_info": { reasoning_parser: null },
+      "http://x/v1/models": { data: [{ id: "/models/m", max_model_len: 262144 }] },
+    });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    expect(result?.apiType).toBe("sglang");
+    expect(result?.models[0].contextWindow).toBe(262144);
+    expect(result?.models[0].input).toEqual(["text", "image"]);
+  });
+
+  it("prefers the renamed endpoints when a server answers both", async () => {
+    mockFetch({
+      "http://x/model_info": { model_path: "/models/new", is_generation: true },
+      "http://x/get_model_info": { model_path: "/models/legacy", is_generation: true },
+      "http://x/server_info": { reasoning_parser: null },
+      "http://x/get_server_info": { reasoning_parser: "qwen3" },
+      "http://x/v1/models": { data: [] },
+    });
+    const result = await detectSglang("http://x", "http://x/v1", "");
+    // Both fields come from the pair that was actually read: the id falls
+    // back to model_path when /v1/models is empty, and reasoning follows
+    // reasoning_parser. Legacy values for either would mean the old
+    // endpoint won.
+    expect(result?.models[0].id).toBe("/models/new");
+    expect(result?.models[0].reasoning).toBe(false);
+  });
+
   it("returns null when /get_model_info is absent", async () => {
     mockFetch({ "http://x/v1/models": { data: [{ id: "m", max_model_len: 4096 }] } });
     expect(await detectSglang("http://x", "http://x/v1", "")).toBeNull();

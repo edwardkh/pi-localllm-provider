@@ -429,14 +429,14 @@ export async function detectOllama(
 //     when SGLang in fact holds one resident model for the process's life.
 //   - the shim's ids are the raw --model-path, same as /v1/models.
 // Two SGLang-only endpoints carry the real answers:
-//   - /get_model_info: has_image_understanding (the vision signal) plus
+//   - /model_info: has_image_understanding (the vision signal) plus
 //     is_generation, which separates a chat server from an embedding one.
-//   - /get_server_info: reasoning_parser, non-null exactly when SGLang was
+//   - /server_info: reasoning_parser, non-null exactly when SGLang was
 //     started with a parser that splits reasoning out of the response —
 //     which is the only sense in which "this server does reasoning" is
 //     true or false, independent of the weights.
 // The context window comes from /v1/models' max_model_len, the same field
-// vLLM publishes; /get_server_info's context_length is the CLI override and
+// vLLM publishes; /server_info's context_length is the CLI override and
 // is null unless it was passed explicitly, so it can't be relied on.
 //
 // compat and thinkingLevelMap are measured, not assumed — see the probe
@@ -634,6 +634,28 @@ interface SglangModels {
   data?: Array<{ id: string; max_model_len?: number }>;
 }
 
+// SGLang renamed /get_model_info and /get_server_info to /model_info and
+// /server_info, and now logs a deprecation warning naming the replacement
+// on every call to the old pair. Both still answer, so nothing is broken
+// yet — but the old names are documented as going away, and a detector
+// that knew only those would stop recognising SGLang at all on the release
+// that removes them, silently falling through to the generic OpenAI path.
+// Ask for the new name first and keep the old one as a fallback, so a
+// server on either side of the rename is detected identically. The cost is
+// one extra 404 per detection against a server that is not SGLang, which
+// the chain already spends several of.
+async function fetchSglangJson<T>(
+  root: string,
+  name: string,
+  apiKey: string,
+  signal?: AbortSignal,
+  diagnostics?: ProbeDiagnostic[],
+): Promise<T | null> {
+  const current = await fetchJson<T>(`${root}/${name}`, apiKey, signal, diagnostics);
+  if (current) return current;
+  return fetchJson<T>(`${root}/get_${name}`, apiKey, signal, diagnostics);
+}
+
 export async function detectSglang(
   root: string,
   baseUrl: string,
@@ -641,13 +663,13 @@ export async function detectSglang(
   signal?: AbortSignal,
   diagnostics?: ProbeDiagnostic[],
 ): Promise<DetectResult | null> {
-  const info = await fetchJson<SglangModelInfo>(`${root}/get_model_info`, apiKey, signal, diagnostics);
+  const info = await fetchSglangJson<SglangModelInfo>(root, "model_info", apiKey, signal, diagnostics);
   // is_generation false means an embedding-only server: it has no chat
   // endpoint to register, so let it fall through rather than claiming it.
   if (!info?.model_path || info.is_generation !== true) return null;
 
   const [serverInfo, modelsRes] = await Promise.all([
-    fetchJson<SglangServerInfo>(`${root}/get_server_info`, apiKey, signal, diagnostics),
+    fetchSglangJson<SglangServerInfo>(root, "server_info", apiKey, signal, diagnostics),
     fetchJson<SglangModels>(`${baseUrl}/models`, apiKey, signal, diagnostics),
   ]);
 

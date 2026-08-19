@@ -92,7 +92,7 @@ No — every configured server re-registers automatically on startup.
 | oMLX | `GET /v1/models/status` | + loaded state, size |
 | LM Studio | `GET /api/v1/models` | + loaded state, size, quantization |
 | llama.cpp (`llama-server`) | `GET /props` + `/v1/models` | context window (`n_ctx`, falls back to `n_ctx_train`), vision, size, `--alias` id |
-| SGLang | `GET /get_model_info` + `/get_server_info` + `/v1/models` | context window, reasoning, vision, measured request compat — see note |
+| SGLang | `GET /model_info` + `/server_info` + `/v1/models` | context window, reasoning, vision, measured request compat — see note |
 | Ollama (native API) | `/api/tags` + `/api/show` per model + `/api/ps` | context window, reasoning, vision, size, quantization, loaded state |
 | vLLM | `GET /version` + `/v1/models` | context window only — see note |
 | ds4 | `GET /v1/models` with `owned_by: "ds4.c"` | context window, max tokens, reasoning, request compat — see note |
@@ -107,7 +107,7 @@ Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM,
 - `/api/ps` isn't implemented, so every model shows as `○ will be loaded on first message` when SGLang in fact holds one model resident for the life of the process.
 - Model ids come through as the raw `--model-path`, so a name like `/models/Org/Model-NVFP4` ends up in the picker.
 
-Probing SGLang first replaces all three with the real answers, from two SGLang-only endpoints: `/get_model_info` for `has_image_understanding` (the vision signal) and `is_generation` (which tells a chat server from an embedding-only one, so the latter falls through instead of being registered), and `/get_server_info` for `reasoning_parser`. That last one is the whole reasoning signal, and it's a property of how the server was launched, not of the weights — SGLang only splits reasoning out of a response when it was started with a parser, so a model that can reason reports `reasoning: false` here until the server is given `--reasoning-parser`. The context window comes from `/v1/models`' `max_model_len`; `/get_server_info`'s `context_length` is the CLI override and stays `null` unless it was passed explicitly.
+Probing SGLang first replaces all three with the real answers, from two SGLang-only endpoints: `/model_info` for `has_image_understanding` (the vision signal) and `is_generation` (which tells a chat server from an embedding-only one, so the latter falls through instead of being registered), and `/server_info` for `reasoning_parser`. That last one is the whole reasoning signal, and it's a property of how the server was launched, not of the weights — SGLang only splits reasoning out of a response when it was started with a parser, so a model that can reason reports `reasoning: false` here until the server is given `--reasoning-parser`. The context window comes from `/v1/models`' `max_model_len`; `/server_info`'s `context_length` is the CLI override and stays `null` unless it was passed explicitly. Both endpoints were called `/get_model_info` and `/get_server_info` before SGLang renamed them; the old names still answer but log a deprecation warning, so they are tried only as a fallback and a server on either side of the rename detects the same.
 
 #### Why SGLang's request compat is measured instead of declared
 
