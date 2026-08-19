@@ -3,7 +3,7 @@
 A Pi extension for wizard-based setup of local LLM servers — MTPLX, oMLX, LM Studio, llama.cpp, Ollama, vLLM, SGLang, ds4, ninfer, or anything else with an OpenAI-compatible API.
 
 - **One command, one place** — `/localllm` is a single TUI menu for adding, inspecting, and managing every local server's integration with Pi — no subcommands, no hand-editing `settings.json`.
-- **Reads the server, doesn't guess** — context window, reasoning, vision, size, quantization: pulled from real backend APIs across 7 detection paths, not typed into a config file and hoped correct.
+- **Reads the server, doesn't guess** — context window, reasoning, vision, size, quantization: pulled from each backend's own API by a detector written for it, and probed directly where a backend publishes nothing, not typed into a config file and hoped correct.
 
 ## Quick start
 

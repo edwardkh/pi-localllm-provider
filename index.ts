@@ -85,7 +85,7 @@ export function normalizeBaseUrl(raw: string): string {
   return stripped.endsWith("/v1") ? stripped : `${stripped}/v1`;
 }
 
-function apiTypeLabel(apiType: ApiType): string {
+export function apiTypeLabel(apiType: ApiType): string {
   switch (apiType) {
     case "mtplx": return "MTPLX";
     case "omlx": return "oMLX";
@@ -95,7 +95,7 @@ function apiTypeLabel(apiType: ApiType): string {
     case "sglang": return "SGLang";
     case "vllm": return "vLLM";
     case "ds4": return "ds4";
-    case "ninfer": return "NInfer";
+    case "ninfer": return "ninfer";
     case "openai": return "OpenAI-compatible";
   }
 }
@@ -182,11 +182,12 @@ function registerServer(pi: ExtensionAPI, server: LLMServer): void {
       // (reasoning_content, etc.) still works if the backend sends it, but
       // nothing about the outgoing request changes because of it.
       //
-      // A detector may opt a model back in via `compat`, but only after its
-      // backend's source has been read and both conventions confirmed —
-      // ds4 is currently the only one that qualifies (see detect.ts). The
-      // defaults stay off for everything else, including hand-edited models
-      // and servers configured before this field existed.
+      // A detector may opt a model back in via `compat`, but only on
+      // evidence: ds4 by having had its source read, SGLang and ninfer by
+      // measuring the server directly, since their accepted values belong to
+      // the loaded chat template rather than to the backend (see detect.ts).
+      // The defaults stay off for everything else, including hand-edited
+      // models and servers configured before this field existed.
       //
       // Note what turning supportsReasoningEffort *on* actually changes: with
       // it off, no reasoning_effort is ever sent and the server keeps using
