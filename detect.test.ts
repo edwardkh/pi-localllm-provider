@@ -312,7 +312,7 @@ describe("detectLlamaCpp", () => {
           id: "gpt-4o-mini",
           name: "gpt-4o-mini",
           contextWindow: 8192,
-          maxTokens: 4096,
+          maxTokens: 8192,
           reasoning: false,
           input: ["text", "image"],
         },
@@ -397,6 +397,19 @@ describe("detectLlamaCpp", () => {
     });
     const result = await detectLlamaCpp("http://x", "");
     expect(result?.models[0].maxTokens).toBe(2048);
+  });
+
+  it("defaults to the context window when /props doesn't expose n_predict (router)", async () => {
+    mockFetch({
+      "http://x/props": {
+        default_generation_settings: { n_ctx: 0, params: null },
+        model_path: "none",
+      },
+      "http://x/v1/models": { data: [{ id: "Qwen3.8-27B-UD-Q4_K_XL", meta: { n_ctx_train: 262144 } }] },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].contextWindow).toBe(262144);
+    expect(result?.models[0].maxTokens).toBe(262144);
   });
 });
 

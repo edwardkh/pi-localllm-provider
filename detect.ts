@@ -341,17 +341,16 @@ export async function detectLlamaCpp(
   // cap worth honoring; unlimited means "generate until the context is
   // full", and contextWindow is the safe ceiling for that because pi-ai
   // clamps max_tokens to the context left after the prompt anyway. A
-  // missing value (e.g. a router that doesn't proxy GenParams) keeps the
-  // old capTokens fallback rather than guessing.
+  // missing value (e.g. a router that doesn't proxy GenParams) is treated
+  // as unlimited too: llama.cpp's own default is -np -1, and contextWindow
+  // is the safe ceiling either way.
   const params = props.default_generation_settings.params;
   const declared =
     typeof params?.n_predict === "number" ? params.n_predict : params?.max_tokens;
   const maxTokens =
-    typeof declared === "number"
-      ? declared <= 0
-        ? contextWindow
-        : Math.min(declared, contextWindow)
-      : capTokens(contextWindow);
+    typeof declared === "number" && declared > 0
+      ? Math.min(declared, contextWindow)
+      : contextWindow;
 
   return {
     apiType: "llamacpp",
