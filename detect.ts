@@ -304,7 +304,12 @@ export async function detectLmStudio(
 // so loaded is left undefined, same as the generic OpenAI probe.
 
 interface LlamaCppProps {
-  default_generation_settings?: { n_ctx?: number };
+  default_generation_settings?: {
+    n_ctx?: number;
+    // llama.cpp's GenParams: n_predict is the canonical output limit,
+    // max_tokens its alias. <= 0 means "no limit" (the -np -1 default).
+    params?: { n_predict?: number; max_tokens?: number };
+  };
   model_path?: string;
   modalities?: { vision?: boolean };
 }
@@ -331,6 +336,23 @@ export async function detectLlamaCpp(
     props.default_generation_settings.n_ctx || entry?.meta?.n_ctx_train || 32768;
   const id = entry?.id ?? props.model_path;
 
+  // The server's own output limit, when it declares one. llama.cpp reports
+  // n_predict in /props (default -1 = unlimited). A positive value is a real
+  // cap worth honoring; unlimited means "generate until the context is
+  // full", and contextWindow is the safe ceiling for that because pi-ai
+  // clamps max_tokens to the context left after the prompt anyway. A
+  // missing value (e.g. a router that doesn't proxy GenParams) keeps the
+  // old capTokens fallback rather than guessing.
+  const params = props.default_generation_settings.params;
+  const declared =
+    typeof params?.n_predict === "number" ? params.n_predict : params?.max_tokens;
+  const maxTokens =
+    typeof declared === "number"
+      ? declared <= 0
+        ? contextWindow
+        : Math.min(declared, contextWindow)
+      : capTokens(contextWindow);
+
   return {
     apiType: "llamacpp",
     models: [
@@ -338,7 +360,7 @@ export async function detectLlamaCpp(
         id,
         name: id.split(/[\\/]/).pop() ?? id,
         contextWindow,
-        maxTokens: capTokens(contextWindow),
+        maxTokens,
         reasoning: false,
         input: props.modalities?.vision ? ["text", "image"] : ["text"],
         sizeBytes: firstNumber(entry?.meta?.size),

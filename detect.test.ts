@@ -354,6 +354,50 @@ describe("detectLlamaCpp", () => {
     const result = await detectLlamaCpp("http://x", "");
     expect(result?.models[0].sizeBytes).toBe(4912898304);
   });
+
+  it("uses the full context window when the server runs with -np -1 (unlimited)", async () => {
+    mockFetch({
+      "http://x/props": {
+        default_generation_settings: { n_ctx: 262144, params: { n_predict: -1, max_tokens: -1 } },
+        model_path: "/models/m.gguf",
+      },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].maxTokens).toBe(262144);
+  });
+
+  it("honors a positive n_predict", async () => {
+    mockFetch({
+      "http://x/props": {
+        default_generation_settings: { n_ctx: 8192, params: { n_predict: 4096 } },
+        model_path: "/models/m.gguf",
+      },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].maxTokens).toBe(4096);
+  });
+
+  it("clamps n_predict above the context window down to the context window", async () => {
+    mockFetch({
+      "http://x/props": {
+        default_generation_settings: { n_ctx: 4096, params: { n_predict: 16384 } },
+        model_path: "/models/m.gguf",
+      },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].maxTokens).toBe(4096);
+  });
+
+  it("reads max_tokens when n_predict is absent", async () => {
+    mockFetch({
+      "http://x/props": {
+        default_generation_settings: { n_ctx: 8192, params: { max_tokens: 2048 } },
+        model_path: "/models/m.gguf",
+      },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].maxTokens).toBe(2048);
+  });
 });
 
 // SGLang's real payloads, trimmed to the fields the detector reads. The
