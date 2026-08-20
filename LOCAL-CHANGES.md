@@ -31,3 +31,23 @@ Divergences from [freeyoung/pi-localllm-provider](https://github.com/freeyoung/p
 - **Tests:** updated the no-params expectation in the "combines /props …" case
   (4096 → 8192); added a router-style case (params null, n_ctx 0, n_ctx_train
   262144 → maxTokens 262144).
+
+## 0.5.2 (3rd change, 2026-08-20) — llama.cpp router: read the real runtime context from /v1/models instead of n_ctx_train
+
+- **Problem:** the llama.cpp *router*'s `/props` reports
+  `default_generation_settings.n_ctx = 0`, so the fallback chain fell through to
+  `meta.n_ctx_train` — the model's trained context baked into the GGUF (e.g.
+  262144) — even though the worker runs `--ctx-size 131072`. The provider then
+  advertised a 262k window (and 262k maxTokens) against a 131k worker.
+- **Change:** `detect.ts` — `LlamaCppModels` extended with `meta.n_ctx` and
+  `status.{value,args}`; new `ctxSizeFromArgs()` helper parses `--ctx-size` from
+  the per-model worker argv. New `contextWindow` fallback chain:
+  `props.n_ctx` (single-server) → `meta.n_ctx` (router, loaded) → `--ctx-size`
+  from `status.args` (router, unloaded) → `n_ctx_train` (last resort) → 32768.
+  Matches the `litellm/init-models.sh` `extract_ctx_size` precedent.
+  `maxTokens` follows automatically (router `params: null` →
+  `maxTokens = contextWindow`).
+- **Tests:** router case in `detect.test.ts` updated to assert 131072 (was
+  asserting the buggy 262144); added an unloaded-model case relying solely on
+  `status.args`. Verified live against a running router: contextWindow/maxTokens
+  now 131072.

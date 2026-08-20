@@ -399,17 +399,53 @@ describe("detectLlamaCpp", () => {
     expect(result?.models[0].maxTokens).toBe(2048);
   });
 
-  it("defaults to the context window when /props doesn't expose n_predict (router)", async () => {
+  it("uses the runtime context from meta.n_ctx in router mode (not n_ctx_train)", async () => {
     mockFetch({
       "http://x/props": {
+        role: "router",
         default_generation_settings: { n_ctx: 0, params: null },
         model_path: "none",
       },
-      "http://x/v1/models": { data: [{ id: "Qwen3.8-27B-UD-Q4_K_XL", meta: { n_ctx_train: 262144 } }] },
+      "http://x/v1/models": {
+        data: [
+          {
+            id: "Qwen3.8-27B-UD-Q4_K_XL",
+            meta: { n_ctx: 131072, n_ctx_train: 262144 },
+            status: {
+              value: "loaded",
+              args: ["--model", "/models/m.gguf", "--ctx-size", "131072"],
+            },
+          },
+        ],
+      },
     });
     const result = await detectLlamaCpp("http://x", "");
-    expect(result?.models[0].contextWindow).toBe(262144);
-    expect(result?.models[0].maxTokens).toBe(262144);
+    expect(result?.models[0].contextWindow).toBe(131072);
+    expect(result?.models[0].maxTokens).toBe(131072);
+  });
+
+  it("falls back to --ctx-size in status.args for an unloaded router model (no meta)", async () => {
+    mockFetch({
+      "http://x/props": {
+        role: "router",
+        default_generation_settings: { n_ctx: 0, params: null },
+        model_path: "none",
+      },
+      "http://x/v1/models": {
+        data: [
+          {
+            id: "Qwen3.6-27B-Q4_K_M",
+            status: {
+              value: "unloaded",
+              args: ["--model", "/models/m.gguf", "--ctx-size", "131072"],
+            },
+          },
+        ],
+      },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].contextWindow).toBe(131072);
+    expect(result?.models[0].maxTokens).toBe(131072);
   });
 });
 

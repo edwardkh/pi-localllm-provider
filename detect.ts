@@ -302,6 +302,12 @@ export async function detectLmStudio(
 // context (n_ctx_train) as a fallback ceiling, and file size. No
 // loaded/unloaded distinction exists — one server process, one model —
 // so loaded is left undefined, same as the generic OpenAI probe.
+//
+// Router mode (llama-server --models-preset) is the exception: /props
+// reports n_ctx: 0, and the real runtime context lives in /v1/models —
+// meta.n_ctx for the loaded model, --ctx-size in status.args for every
+// preset model (loaded or not). n_ctx_train is the GGUF's trained
+// context and is only a last resort.
 
 interface LlamaCppProps {
   default_generation_settings?: {
@@ -315,7 +321,20 @@ interface LlamaCppProps {
 }
 
 interface LlamaCppModels {
-  data?: Array<{ id: string; meta?: { n_ctx_train?: number; size?: number } | null }>;
+  data?: Array<{
+    id: string;
+    meta?: { n_ctx?: number; n_ctx_train?: number; size?: number } | null;
+    status?: { value?: string; args?: string[] } | null;
+  }>;
+}
+
+// The router launches each worker with --ctx-size on the command line and
+// exposes that argv per model in /v1/models status.args.
+function ctxSizeFromArgs(args?: string[]): number | undefined {
+  if (!args) return undefined;
+  const i = args.indexOf("--ctx-size");
+  const v = i >= 0 ? Number(args[i + 1]) : NaN;
+  return Number.isFinite(v) && v > 0 ? v : undefined;
 }
 
 export async function detectLlamaCpp(
@@ -333,7 +352,11 @@ export async function detectLlamaCpp(
   const entry = modelsRes?.data?.[0];
 
   const contextWindow =
-    props.default_generation_settings.n_ctx || entry?.meta?.n_ctx_train || 32768;
+    props.default_generation_settings.n_ctx ||
+    entry?.meta?.n_ctx ||
+    ctxSizeFromArgs(entry?.status?.args) ||
+    entry?.meta?.n_ctx_train ||
+    32768;
   const id = entry?.id ?? props.model_path;
 
   // The server's own output limit, when it declares one. llama.cpp reports
