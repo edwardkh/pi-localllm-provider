@@ -91,7 +91,7 @@ No — every configured server re-registers automatically on startup.
 | MTPLX | `GET /health` | context window, max tokens, reasoning, vision |
 | oMLX | `GET /v1/models/status` | + loaded state, size |
 | LM Studio | `GET /api/v1/models` | + loaded state, size, quantization |
-| llama.cpp (`llama-server`) | `GET /props` + `/v1/models` | context window (`n_ctx`, falls back to `n_ctx_train`), vision, size, `--alias` id |
+| llama.cpp (`llama-server`) | `GET /props` + `/v1/models` | context window (`n_ctx`, falls back to `n_ctx_train`), vision, size, `--alias` id. In router mode (`--models-preset`) all preset models are listed with loaded state, `--ctx-size`/`--n-predict` from each worker's argv, and quantization from `meta.ftype` |
 | SGLang | `GET /model_info` + `/server_info` + `/v1/models` | context window, reasoning, vision, measured request compat — see note |
 | Ollama (native API) | `/api/tags` + `/api/show` per model + `/api/ps` | context window, reasoning, vision, size, quantization, loaded state |
 | vLLM | `GET /version` + `/v1/models` | context window only — see note |
@@ -99,7 +99,7 @@ No — every configured server re-registers automatically on startup.
 | ninfer | `GET /v1/models` with `owned_by: "ninfer"` | context window, reasoning, vision, request compat — all measured, see note |
 | OpenAI-compatible | `GET /v1/models` | context window from `max_model_len`, `top_provider.context_length`, `context_window` or `context_length`; name, reasoning and vision from an OpenRouter-style card |
 
-Only oMLX, LM Studio, and Ollama report loaded state — MTPLX, llama.cpp, vLLM, SGLang, ninfer, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
+Only oMLX, LM Studio, Ollama, and llama.cpp in router mode report loaded state — MTPLX, llama.cpp (single-server), vLLM, SGLang, ninfer, and ds4 each serve exactly one model, so there's no loaded/unloaded distinction to make.
 
 **SGLang is probed before Ollama, and the order matters.** SGLang ships an Ollama compatibility shim, so its `/api/tags` and `/api/show` answer with Ollama-shaped payloads — enough for the Ollama probe to claim it if it got there first. The shim is lossy in three ways that all read as a working setup, which is what makes the mislabel worth preventing:
 

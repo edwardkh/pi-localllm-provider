@@ -447,6 +447,98 @@ describe("detectLlamaCpp", () => {
     expect(result?.models[0].contextWindow).toBe(131072);
     expect(result?.models[0].maxTokens).toBe(131072);
   });
+
+  it("enumerates every preset model in router mode (loaded and unloaded)", async () => {
+    mockFetch({
+      "http://x/props": {
+        role: "router",
+        default_generation_settings: { n_ctx: 0, params: null },
+        model_path: "none",
+      },
+      "http://x/v1/models": {
+        data: [
+          {
+            id: "Qwen3.8-27B-UD-Q4_K_XL",
+            meta: { n_ctx: 131072, n_ctx_train: 262144, size: 17548181504, ftype: "Q4_K - Medium" },
+            status: {
+              value: "loaded",
+              args: [
+                "--alias", "Qwen3.8-27B-UD-Q4_K_XL",
+                "--ctx-size", "131072",
+                "--n-predict", "-1",
+                "--mmproj", "/models/unsloth/mmproj-BF16.gguf",
+              ],
+            },
+            architecture: { input_modalities: ["text", "image"] },
+          },
+          {
+            id: "Qwen3.8-27B-UD-Q6_K_XL",
+            meta: null,
+            status: {
+              value: "unloaded",
+              args: ["--ctx-size", "131072", "--n-predict", "-1"],
+            },
+          },
+        ],
+      },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.apiType).toBe("llamacpp");
+    expect(result?.models).toHaveLength(2);
+    const [q4, q6] = result!.models;
+    expect(q4.id).toBe("Qwen3.8-27B-UD-Q4_K_XL");
+    expect(q6.id).toBe("Qwen3.8-27B-UD-Q6_K_XL");
+    // Loaded model: meta.n_ctx wins over n_ctx_train (262144).
+    expect(q4.contextWindow).toBe(131072);
+    // Unloaded model: --ctx-size from the worker argv.
+    expect(q6.contextWindow).toBe(131072);
+    expect(q4.loaded).toBe(true);
+    expect(q6.loaded).toBe(false);
+    expect(q4.sizeBytes).toBe(17548181504);
+    expect(q4.quantization).toBe("Q4_K - Medium");
+    expect(q4.input).toEqual(["text", "image"]);
+    expect(q6.input).toEqual(["text"]);
+    // -np -1 (unlimited) → contextWindow is the ceiling for both.
+    expect(q4.maxTokens).toBe(q4.contextWindow);
+    expect(q6.maxTokens).toBe(q6.contextWindow);
+  });
+
+  it("honors a positive --n-predict in the router worker argv, clamped to the context window", async () => {
+    mockFetch({
+      "http://x/props": {
+        role: "router",
+        default_generation_settings: { n_ctx: 0, params: null },
+        model_path: "none",
+      },
+      "http://x/v1/models": {
+        data: [
+          {
+            id: "a",
+            status: { value: "loaded", args: ["--ctx-size", "131072", "--n-predict", "4096"] },
+          },
+          {
+            id: "b",
+            status: { value: "loaded", args: ["--ctx-size", "4096", "--n-predict", "16384"] },
+          },
+        ],
+      },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].maxTokens).toBe(4096);
+    expect(result?.models[1].maxTokens).toBe(4096);
+  });
+
+  it("returns an empty model list (not null) for a router with no models", async () => {
+    mockFetch({
+      "http://x/props": {
+        role: "router",
+        default_generation_settings: { n_ctx: 0, params: null },
+        model_path: "none",
+      },
+      "http://x/v1/models": { data: [] },
+    });
+    expect(await detectLlamaCpp("http://x", "")).toEqual({ apiType: "llamacpp", models: [] });
+  });
 });
 
 // SGLang's real payloads, trimmed to the fields the detector reads. The
@@ -1132,6 +1224,25 @@ describe("detectModels chain", () => {
     });
     const result = await detectModels("http://x/v1", "");
     expect(result.apiType).toBe("llamacpp");
+  });
+
+  it("detects a llama.cpp router as llamacpp with all preset models (no OpenAI fall-through)", async () => {
+    mockFetch({
+      "http://x/props": {
+        role: "router",
+        default_generation_settings: { n_ctx: 0, params: null },
+        model_path: "none",
+      },
+      "http://x/v1/models": {
+        data: [
+          { id: "a", status: { value: "loaded", args: ["--ctx-size", "131072"] } },
+          { id: "b", status: { value: "unloaded", args: ["--ctx-size", "131072"] } },
+        ],
+      },
+    });
+    const result = await detectModels("http://x/v1", "");
+    expect(result.apiType).toBe("llamacpp");
+    expect(result.models).toHaveLength(2);
   });
 
   it("falls through to Ollama when the above are all absent", async () => {

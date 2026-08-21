@@ -119,8 +119,9 @@ export function modelIdsChanged(before: LLMModel[], after: LLMModel[]): boolean 
 }
 
 // "✓ " when known-loaded, "○ " when known-not-loaded, "" when the backend
-// doesn't report loaded state at all (mtplx/llamacpp/vllm/generic OpenAI —
-// see detect.ts for why).
+// doesn't report loaded state at all (mtplx/llamacpp single-server/vllm/
+// generic OpenAI — see detect.ts for why; llama.cpp in router mode does
+// report it).
 function loadedIcon(loaded: boolean | undefined): string {
   if (loaded === true) return "✓ ";
   if (loaded === false) return "○ ";
@@ -128,7 +129,8 @@ function loadedIcon(loaded: boolean | undefined): string {
 }
 
 // Only backends that can actually distinguish loaded/unloaded models
-// (oMLX, LM Studio, Ollama) ever set this — see detect.ts.
+// (oMLX, LM Studio, Ollama, and llama.cpp in router mode) ever set this —
+// see detect.ts.
 export function modelsHeading(models: LLMModel[]): string {
   const reportsLoaded = models.some((m) => m.loaded !== undefined);
   return reportsLoaded

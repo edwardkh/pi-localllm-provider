@@ -51,3 +51,31 @@ Divergences from [freeyoung/pi-localllm-provider](https://github.com/freeyoung/p
   asserting the buggy 262144); added an unloaded-model case relying solely on
   `status.args`. Verified live against a running router: contextWindow/maxTokens
   now 131072.
+
+## 0.5.2 (4th change, 2026-08-20) — llama.cpp router: enumerate all preset models instead of only the first
+
+- **Problem:** `detectLlamaCpp` read only `/v1/models` `data[0]` and returned a
+  one-element model list, so a router (`llama-server --models-preset`) silently
+  dropped every preset model after the first — a second model added to
+  `preset.ini` never appeared in the picker.
+- **Change:** `detect.ts` — router mode is detected up front
+  (`props.role === "router" || props.model_path === "none"`) and every
+  `/v1/models` entry is mapped to a model:
+  - `contextWindow`: `meta.n_ctx` → `--ctx-size` from `status.args` →
+    `n_ctx_train` → 32768 (same precedence as the 3rd change).
+  - `maxTokens`: `--n-predict` (alias `--max-tokens`) from the worker argv;
+    positive → clamped to `contextWindow`, `-1`/absent → `contextWindow`.
+  - `name`: `--alias` from the worker argv, else the id basename.
+  - `input`: `["text","image"]` when `architecture.input_modalities` includes
+    `image` or the worker argv has `--mmproj`.
+  - `loaded`: `status.value === "loaded"`; `sizeBytes`: `meta.size`;
+    `quantization`: `meta.ftype`.
+  - An empty model list returns `{ apiType: "llamacpp", models: [] }` (not
+    `null`) so the backend isn't mislabeled by the generic OpenAI probe.
+  The single-server path is unchanged. `ctxSizeFromArgs()` generalized to
+  `argValue(args, flag)`.
+- **Tests:** `detect.test.ts` — router two-model case (loaded + unloaded,
+  context sources, loaded flags, size, quantization, modalities), positive
+  `--n-predict` honored and clamped, empty-`data` case, and a `detectModels`
+  chain case proving no fall-through to the OpenAI probe. Existing
+  single-server cases pass unmodified.

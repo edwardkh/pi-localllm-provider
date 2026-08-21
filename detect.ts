@@ -299,15 +299,18 @@ export async function detectLmStudio(
 // ─── llama.cpp server (llama-server) ───────────────────────────────
 // /props has the runtime-configured context (n_ctx) and vision support;
 // /v1/models has the id (respects --alias), the model's trained max
-// context (n_ctx_train) as a fallback ceiling, and file size. No
-// loaded/unloaded distinction exists — one server process, one model —
-// so loaded is left undefined, same as the generic OpenAI probe.
+// context (n_ctx_train) as a fallback ceiling, and file size. A plain
+// single-server process serves exactly one model, so loaded is left
+// undefined, same as the generic OpenAI probe.
 //
 // Router mode (llama-server --models-preset) is the exception: /props
-// reports n_ctx: 0, and the real runtime context lives in /v1/models —
-// meta.n_ctx for the loaded model, --ctx-size in status.args for every
-// preset model (loaded or not). n_ctx_train is the GGUF's trained
-// context and is only a last resort.
+// reports role: "router" and n_ctx: 0, and /v1/models lists every preset
+// model. The real runtime context lives per model — meta.n_ctx for the
+// loaded one, --ctx-size in status.args for every preset model (loaded
+// or not); n_ctx_train is the GGUF's trained context and is only a last
+// resort. status.value gives the loaded/unloaded state, --n-predict in
+// status.args the per-worker output limit, and meta.ftype the
+// quantization.
 
 interface LlamaCppProps {
   default_generation_settings?: {
@@ -318,21 +321,26 @@ interface LlamaCppProps {
   };
   model_path?: string;
   modalities?: { vision?: boolean };
+  // The router reports role: "router" (and model_path: "none").
+  role?: string;
 }
 
 interface LlamaCppModels {
   data?: Array<{
     id: string;
-    meta?: { n_ctx?: number; n_ctx_train?: number; size?: number } | null;
+    meta?: { n_ctx?: number; n_ctx_train?: number; size?: number; ftype?: string } | null;
     status?: { value?: string; args?: string[] } | null;
+    architecture?: { input_modalities?: string[] };
   }>;
 }
 
-// The router launches each worker with --ctx-size on the command line and
-// exposes that argv per model in /v1/models status.args.
-function ctxSizeFromArgs(args?: string[]): number | undefined {
+// The router launches each worker with --ctx-size (and --n-predict) on the
+// command line and exposes that argv per model in /v1/models status.args.
+// Only positive finite values are returned: -1 is llama.cpp's "unlimited"
+// sentinel and means "no declared limit".
+function argValue(args: string[] | undefined, flag: string): number | undefined {
   if (!args) return undefined;
-  const i = args.indexOf("--ctx-size");
+  const i = args.indexOf(flag);
   const v = i >= 0 ? Number(args[i + 1]) : NaN;
   return Number.isFinite(v) && v > 0 ? v : undefined;
 }
@@ -344,6 +352,51 @@ export async function detectLlamaCpp(
   diagnostics?: ProbeDiagnostic[],
 ): Promise<DetectResult | null> {
   const props = await fetchJson<LlamaCppProps>(`${root}/props`, apiKey, signal, diagnostics);
+  const isRouter = props?.role === "router" || props?.model_path === "none";
+
+  if (isRouter) {
+    // The router lists every preset model on /v1/models, loaded or not.
+    const modelsRes = await fetchJson<LlamaCppModels>(`${root}/v1/models`, apiKey, signal, diagnostics);
+    const models = (modelsRes?.data ?? [])
+      .filter((entry) => typeof entry.id === "string" && entry.id.length > 0)
+      .map((entry) => {
+        const args = entry.status?.args;
+        const contextWindow =
+          firstNumber(entry.meta?.n_ctx) ??
+          argValue(args, "--ctx-size") ??
+          firstNumber(entry.meta?.n_ctx_train) ??
+          32768;
+        // The worker's own output limit, from its argv. -1 (unlimited) and
+        // absent both mean "generate until the context is full", so
+        // contextWindow is the safe ceiling — pi-ai clamps max_tokens to
+        // the context left after the prompt anyway.
+        const declared = argValue(args, "--n-predict") ?? argValue(args, "--max-tokens");
+        const aliasIdx = args?.indexOf("--alias") ?? -1;
+        const alias = args && aliasIdx >= 0 ? args[aliasIdx + 1] : undefined;
+        const input: ("text" | "image")[] =
+          entry.architecture?.input_modalities?.includes("image") || args?.includes("--mmproj")
+            ? ["text", "image"]
+            : ["text"];
+        return {
+          id: entry.id,
+          name: alias ?? entry.id.split(/[\\/]/).pop() ?? entry.id,
+          contextWindow,
+          maxTokens:
+            typeof declared === "number" && declared > 0
+              ? Math.min(declared, contextWindow)
+              : contextWindow,
+          reasoning: false,
+          input,
+          loaded: entry.status?.value === "loaded",
+          sizeBytes: firstNumber(entry.meta?.size),
+          quantization: entry.meta?.ftype,
+        };
+      });
+    // An empty list is a real (if odd) router state, not a detection miss —
+    // returning null would let the generic OpenAI probe mislabel the backend.
+    return { apiType: "llamacpp", models };
+  }
+
   if (typeof props?.default_generation_settings?.n_ctx !== "number" || !props.model_path) {
     return null;
   }
@@ -354,7 +407,7 @@ export async function detectLlamaCpp(
   const contextWindow =
     props.default_generation_settings.n_ctx ||
     entry?.meta?.n_ctx ||
-    ctxSizeFromArgs(entry?.status?.args) ||
+    argValue(entry?.status?.args, "--ctx-size") ||
     entry?.meta?.n_ctx_train ||
     32768;
   const id = entry?.id ?? props.model_path;
